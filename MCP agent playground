@@ -1,0 +1,610 @@
+from __future__ import annotations
+
+import json
+import os
+import time
+from typing import Any, Dict
+
+import streamlit as st
+import streamlit.components.v1 as components
+from dotenv import load_dotenv
+
+from mcp_simulator import (
+    LOCAL_TOOLS,
+    REMOTE_TOOLS,
+    build_trace,
+    execute_local_tool,
+    execute_remote_tool,
+    pretty_json,
+)
+
+load_dotenv()
+
+st.set_page_config(page_title="MCP Agent Playground", page_icon="🧩", layout="wide")
+
+st.markdown(
+    """
+<style>
+    .main-title {font-size: 2.4rem; font-weight: 800; margin-bottom: 0.2rem;}
+    .subtitle {font-size: 1.05rem; opacity: 0.8; margin-bottom: 1rem;}
+    .pill {display:inline-block; padding:0.25rem 0.65rem; border:1px solid #8884; border-radius:999px; margin-right:0.35rem; font-size:0.85rem;}
+    .flow-card {border:1px solid #8883; border-radius:14px; padding:14px; margin-bottom:10px; background:rgba(128,128,128,0.04);}
+    .actor {font-weight:700; font-size:1rem;}
+    .tiny {font-size:0.8rem; opacity:0.7;}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.markdown('<div class="main-title">🧩 MCP Agent Playground</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="subtitle">Explore how an AI agent discovers and calls tools through <b>local</b> and <b>remote</b> MCP servers.</div>',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    '<span class="pill">Agent</span><span class="pill">MCP Client</span><span class="pill">MCP Server</span><span class="pill">Tools</span><span class="pill">Resources</span>',
+    unsafe_allow_html=True,
+)
+
+with st.sidebar:
+    st.header("Playground Controls")
+    show_protocol = st.toggle("Show raw MCP-style messages", value=True)
+    animate = st.toggle("Animate execution", value=True)
+    use_openai = st.toggle("Use OpenAI for explanation", value=False)
+    api_key = st.text_input("OpenAI API Key", type="password", value=os.getenv("OPENAI_API_KEY", "")) if use_openai else ""
+    st.divider()
+    st.caption("The playground works without an API key. OpenAI is optional and is used only to explain the trace.")
+
+
+def render_architecture(mode: str) -> None:
+    if mode == "local":
+        st.graphviz_chart(
+            """
+            digraph G {
+                rankdir=LR;
+                node [shape=box style="rounded"];
+                User -> Agent [label="prompt"];
+                Agent -> Client [label="select tool"];
+                Client -> Server [label="stdio / local process"];
+                Server -> Tool [label="execute"];
+                Tool -> Server [label="result"];
+                Server -> Client [label="structured response"];
+                Client -> Agent [label="context"];
+                Agent -> User [label="answer"];
+            }
+            """,
+            use_container_width=True,
+        )
+    else:
+        st.graphviz_chart(
+            """
+            digraph G {
+                rankdir=LR;
+                node [shape=box style="rounded"];
+                User -> Agent [label="prompt"];
+                Agent -> Client [label="select tool"];
+                Client -> Gateway [label="HTTPS + auth"];
+                Gateway -> RemoteServer [label="SSE / Streamable HTTP"];
+                RemoteServer -> ExternalAPI [label="API / database"];
+                ExternalAPI -> RemoteServer [label="data"];
+                RemoteServer -> Client [label="MCP result"];
+                Client -> Agent [label="context"];
+                Agent -> User [label="answer"];
+            }
+            """,
+            use_container_width=True,
+        )
+
+
+def _render_trace_item(item: dict[str, Any]) -> None:
+    st.markdown(
+        f"""
+<div class="flow-card">
+  <div class="actor">Step {item['step']}: {item['actor']} — {item['action']}</div>
+  <div>{item['detail']}</div>
+  <div class="tiny">{item['timestamp']}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    if show_protocol:
+        st.code(pretty_json(item["payload"]), language="json")
+
+
+def render_trace(trace: list[dict[str, Any]]) -> None:
+    if not animate:
+        for item in trace:
+            _render_trace_item(item)
+        return
+
+    progress = st.progress(0, text="Starting MCP execution...")
+    stage = st.empty()
+    trace_area = st.empty()
+    rendered: list[dict[str, Any]] = []
+
+    for index, item in enumerate(trace, start=1):
+        stage.info(f"Running Step {item['step']}: {item['actor']} — {item['action']}")
+        rendered.append(item)
+
+        # Rebuild the placeholder with all completed steps. This forces visible,
+        # progressive updates instead of displaying the entire trace at once.
+        with trace_area.container():
+            for completed_item in rendered:
+                _render_trace_item(completed_item)
+
+        progress.progress(
+            int(index / len(trace) * 100),
+            text=f"Completed {index} of {len(trace)} MCP stages",
+        )
+        time.sleep(0.75)
+
+    stage.success("MCP execution trace completed")
+    time.sleep(0.35)
+    stage.empty()
+    progress.empty()
+
+
+
+def render_visual_animation(mode: str) -> None:
+    """Render a reliable browser-side animation independent of Streamlit reruns."""
+    transport = "STDIO" if mode == "local" else "HTTPS / Streamable HTTP"
+    server = "Local MCP Server" if mode == "local" else "Remote MCP Server"
+    html = f"""
+    <div class="mcp-animation-wrap">
+      <div class="mcp-animation-title">LIVE MCP EXECUTION</div>
+      <div class="mcp-flow">
+        <div class="mcp-node" id="n0">🤖<span>AI Agent</span></div>
+        <div class="mcp-arrow"><span class="packet">●</span>→</div>
+        <div class="mcp-node" id="n1">🔌<span>MCP Client</span></div>
+        <div class="mcp-arrow"><span class="packet delay1">●</span>→</div>
+        <div class="mcp-node" id="n2">🖥️<span>{server}</span><small>{transport}</small></div>
+        <div class="mcp-arrow"><span class="packet delay2">●</span>→</div>
+        <div class="mcp-node" id="n3">🛠️<span>Tool Execution</span></div>
+        <div class="mcp-arrow"><span class="packet delay3">●</span>→</div>
+        <div class="mcp-node" id="n4">✅<span>Result</span></div>
+      </div>
+      <div id="status" class="mcp-status">Agent is understanding the request…</div>
+      <div class="mcp-progress"><div id="bar"></div></div>
+    </div>
+    <style>
+      body {{ margin:0; font-family:Arial,sans-serif; }}
+      .mcp-animation-wrap {{border:1px solid #b8c2d1;border-radius:16px;padding:18px;background:linear-gradient(135deg,#f8fbff,#eef4ff);overflow:hidden}}
+      .mcp-animation-title {{font-weight:800;letter-spacing:1px;margin-bottom:16px;color:#1f3b65}}
+      .mcp-flow {{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:820px}}
+      .mcp-node {{width:135px;height:92px;border:2px solid #9aa9bd;border-radius:14px;background:white;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:25px;transition:.3s;box-shadow:0 4px 12px rgba(0,0,0,.06)}}
+      .mcp-node span {{font-size:14px;font-weight:700;margin-top:7px;text-align:center}}
+      .mcp-node small {{font-size:10px;margin-top:3px;color:#596579}}
+      .mcp-node.active {{transform:scale(1.08);border-color:#246bfd;box-shadow:0 0 0 7px rgba(36,107,253,.13),0 8px 20px rgba(36,107,253,.25)}}
+      .mcp-node.done {{border-color:#1f9d64;background:#effcf5}}
+      .mcp-arrow {{position:relative;font-size:28px;color:#73829a;min-width:42px;text-align:center}}
+      .packet {{position:absolute;font-size:15px;color:#246bfd;left:-5px;top:8px;animation:movePacket 1.25s linear infinite}}
+      .delay1 {{animation-delay:.25s}} .delay2 {{animation-delay:.5s}} .delay3 {{animation-delay:.75s}}
+      @keyframes movePacket {{0%{{left:-8px;opacity:0}}20%{{opacity:1}}80%{{opacity:1}}100%{{left:34px;opacity:0}}}}
+      .mcp-status {{margin-top:17px;padding:10px 12px;border-radius:9px;background:#fff;font-weight:700;color:#26364d}}
+      .mcp-progress {{height:9px;background:#dce4ef;border-radius:9px;margin-top:10px;overflow:hidden}}
+      #bar {{height:100%;width:0;background:linear-gradient(90deg,#246bfd,#22a06b);transition:width .45s}}
+    </style>
+    <script>
+      const labels = [
+        'Agent is understanding the request…',
+        'MCP Client is discovering and selecting a tool…',
+        '{server} received the MCP request through {transport}…',
+        'The selected tool is executing…',
+        'Structured result returned to the agent.'
+      ];
+      let step=0;
+      function showStep() {{
+        for(let i=0;i<5;i++){{
+          const n=document.getElementById('n'+i);
+          n.classList.remove('active');
+          if(i<step) n.classList.add('done'); else n.classList.remove('done');
+        }}
+        document.getElementById('n'+step).classList.add('active');
+        document.getElementById('status').innerText=labels[step];
+        document.getElementById('bar').style.width=((step+1)*20)+'%';
+        step=(step+1)%5;
+        if(step===0){{ setTimeout(()=>{{ for(let i=0;i<5;i++) document.getElementById('n'+i).classList.remove('done'); }},600); }}
+      }}
+      showStep();
+      setInterval(showStep,1100);
+    </script>
+    """
+    components.html(html, height=190, scrolling=True)
+
+def explain_with_openai(trace: list[dict[str, Any]], mode: str, key: str) -> str:
+    if not key:
+        return "Enter an OpenAI API key in the sidebar to enable AI-generated explanations."
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=key)
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=(
+                f"Explain this {mode} MCP execution trace to a beginner. Keep it clear, practical, and under 180 words. "
+                f"Mention the roles of the agent, MCP client, MCP server, and tool. Trace: {json.dumps(trace)}"
+            ),
+        )
+        return response.output_text
+    except Exception as exc:
+        return f"OpenAI explanation could not be generated: {exc}"
+
+
+local_tab, remote_tab, compare_tab = st.tabs(["💻 Local MCP Lab", "🌐 Remote MCP Lab", "⚖️ Compare Both"])
+
+with local_tab:
+    st.subheader("Local MCP: Agent and server on the same machine")
+    st.info("Typical transport: **stdio**. The agent starts or connects to a local MCP server process and exchanges JSON-RPC style messages.")
+    render_architecture("local")
+
+    left, right = st.columns([1, 1])
+    with left:
+        local_tool = st.selectbox("Choose a local MCP tool", list(LOCAL_TOOLS), format_func=lambda x: f"{x} — {LOCAL_TOOLS[x]['description']}")
+        st.caption(f"Input schema: `{LOCAL_TOOLS[local_tool]['input_schema']}`")
+        if local_tool == "read_inventory":
+            arguments: Dict[str, Any] = {"product": st.selectbox("Product", ["Laptop", "Keyboard", "Monitor", "Mouse"])}
+            request = st.text_input("User request", value=f"Check the stock status of {arguments['product']}.")
+        elif local_tool == "calculate_bmi":
+            weight = st.number_input("Weight (kg)", min_value=1.0, value=70.0)
+            height = st.number_input("Height (cm)", min_value=50.0, value=170.0)
+            arguments = {"weight_kg": weight, "height_cm": height}
+            request = st.text_input("User request", value="Calculate my BMI and category.")
+        else:
+            notes = st.text_area("Meeting notes", value="The team reviewed the MCP demo. Action: prepare the Streamlit lab. Send the final ZIP to participants.")
+            arguments = {"notes": notes}
+            request = st.text_input("User request", value="Summarize these notes and find action items.")
+
+        run_local = st.button("▶ Run Local MCP Flow", type="primary", use_container_width=True)
+
+    with right:
+        st.markdown("#### Tools exposed by the local MCP server")
+        st.json(LOCAL_TOOLS)
+        st.markdown("#### Why local MCP?")
+        st.write("Fast development, private data access, desktop automation, local files, command-line tools, and safe experimentation.")
+
+    if run_local:
+        result = execute_local_tool(local_tool, arguments)
+        trace = build_trace("local", request, local_tool, arguments, result)
+        st.markdown("### Live MCP Execution Animation")
+        if animate:
+            render_visual_animation("local")
+        else:
+            st.info("Enable **Animate execution** in the sidebar to view the live flow.")
+        st.success("Local MCP execution completed")
+        c1, c2 = st.columns([1.2, 1])
+        with c1:
+            st.markdown("### Execution Trace")
+            render_trace(trace)
+        with c2:
+            st.markdown("### Final Tool Result")
+            st.json(result)
+            st.markdown("### Agent-style response")
+            st.write(f"The agent received this structured result from the local MCP tool: **{result}**")
+            if use_openai:
+                st.markdown("### AI explanation")
+                st.write(explain_with_openai(trace, "local", api_key))
+
+with remote_tab:
+    st.subheader("Remote MCP: Agent connects to a server over the network")
+    st.info("Typical transports: **Streamable HTTP or SSE**. Authentication, latency, reliability, and permissions become important.")
+    render_architecture("remote")
+
+    left, right = st.columns([1, 1])
+    with left:
+        remote_tool = st.selectbox("Choose a remote MCP tool", list(REMOTE_TOOLS), format_func=lambda x: f"{x} — {REMOTE_TOOLS[x]['description']}")
+        auth_enabled = st.toggle("Attach bearer-token authentication", value=True)
+        latency = st.slider("Simulated network latency (ms)", 0, 2000, 650, 50)
+        fail_rate = st.slider("Simulated failure probability (%)", 0, 50, 0, 5)
+
+        if remote_tool == "get_weather":
+            value = st.selectbox("City", ["Bengaluru", "Pune", "Delhi", "Mumbai"])
+            arguments = {"city": value}
+            request = st.text_input("Remote user request", value=f"What is the weather in {value}?")
+        elif remote_tool == "lookup_country":
+            value = st.selectbox("Country", ["India", "Japan", "Germany", "Brazil"])
+            arguments = {"country": value}
+            request = st.text_input("Remote user request", value=f"Give me key facts about {value}.")
+        else:
+            value = st.selectbox("Topic", ["Artificial Intelligence", "Python", "Agents", "Data Analysis"])
+            arguments = {"topic": value}
+            request = st.text_input("Remote user request", value=f"Find books about {value}.")
+
+        run_remote = st.button("🚀 Run Remote MCP Flow", type="primary", use_container_width=True)
+
+    with right:
+        st.markdown("#### Remote server configuration")
+        st.code(
+            json.dumps({
+                "server_url": "https://demo-mcp.example.com/mcp",
+                "transport": "streamable-http",
+                "authentication": "Bearer token" if auth_enabled else "None",
+                "timeout_seconds": 10,
+            }, indent=2),
+            language="json",
+        )
+        st.markdown("#### Remote MCP concerns")
+        st.write("Authentication, authorization, encryption, rate limits, timeouts, audit logs, server trust, and data privacy.")
+
+    if run_remote:
+        result = execute_remote_tool(remote_tool, arguments, latency, fail_rate)
+        trace = build_trace("remote", request, remote_tool, arguments, result, include_auth=auth_enabled)
+        st.markdown("### Live MCP Execution Animation")
+        if animate:
+            render_visual_animation("remote")
+        else:
+            st.info("Enable **Animate execution** in the sidebar to view the live flow.")
+        if result.get("status") == "remote_error":
+            st.error("Remote MCP execution failed. Inspect the trace to understand where failures occur.")
+        else:
+            st.success("Remote MCP execution completed")
+        c1, c2 = st.columns([1.2, 1])
+        with c1:
+            st.markdown("### Execution Trace")
+            render_trace(trace)
+        with c2:
+            st.markdown("### Final Tool Result")
+            st.json(result)
+            st.metric("Simulated latency", f"{latency} ms")
+            st.markdown("### Agent-style response")
+            st.write(f"The agent received this structured response from the remote MCP service: **{result}**")
+            if use_openai:
+                st.markdown("### AI explanation")
+                st.write(explain_with_openai(trace, "remote", api_key))
+
+with compare_tab:
+    st.subheader("Local MCP vs Remote MCP")
+    st.table({
+        "Area": ["Connection", "Best for", "Latency", "Security focus", "Failure modes", "Example"],
+        "Local MCP": ["stdio / local process", "Files, desktop tools, local databases", "Usually low", "OS permissions and process isolation", "Process crash, missing dependency", "Agent reads a local CSV"],
+        "Remote MCP": ["HTTP / SSE", "Shared enterprise services and cloud tools", "Network-dependent", "Authentication, TLS, authorization", "Timeout, 401, 429, 5xx", "Agent calls company CRM"],
+    })
+
+    st.markdown("### Build the mental model")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("1", "Agent decides")
+    col2.metric("2", "Client speaks MCP")
+    col3.metric("3", "Server runs tools")
+    col4.metric("4", "Result grounds answer")
+
+    st.markdown("### Mini challenge")
+    scenario = st.radio(
+        "Where should the MCP server run?",
+        [
+            "Read confidential files stored only on my laptop",
+            "Allow 500 employees to access a shared HR tool",
+            "Test a new tool during development",
+            "Expose a governed company service to multiple AI assistants",
+        ],
+    )
+    answer_map = {
+        "Read confidential files stored only on my laptop": "Local MCP is usually the better starting point.",
+        "Allow 500 employees to access a shared HR tool": "Remote MCP is usually more suitable because it can be centrally managed.",
+        "Test a new tool during development": "Local MCP is simpler and faster for experimentation.",
+        "Expose a governed company service to multiple AI assistants": "Remote MCP supports shared, authenticated enterprise access.",
+    }
+    if st.button("Reveal answer"):
+        st.success(answer_map[scenario])
+
+st.divider()
+st.caption("Educational simulator: protocol messages and remote data are intentionally simplified for training purposes.")
+
+from __future__ import annotations
+
+import json
+import random
+import time
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Any, Callable, Dict, List
+
+
+@dataclass
+class MCPEvent:
+    step: int
+    actor: str
+    action: str
+    detail: str
+    payload: Dict[str, Any]
+    timestamp: str
+
+
+LOCAL_TOOLS: Dict[str, Dict[str, Any]] = {
+    "read_inventory": {
+        "description": "Read inventory details for a product from a local data source.",
+        "input_schema": {"product": "string"},
+    },
+    "calculate_bmi": {
+        "description": "Calculate BMI using weight and height.",
+        "input_schema": {"weight_kg": "number", "height_cm": "number"},
+    },
+    "summarize_notes": {
+        "description": "Summarize local meeting notes.",
+        "input_schema": {"notes": "string"},
+    },
+}
+
+REMOTE_TOOLS: Dict[str, Dict[str, Any]] = {
+    "get_weather": {
+        "description": "Retrieve weather information from a remote MCP service.",
+        "input_schema": {"city": "string"},
+    },
+    "lookup_country": {
+        "description": "Retrieve country facts from a remote MCP service.",
+        "input_schema": {"country": "string"},
+    },
+    "search_books": {
+        "description": "Search books through a remote MCP service.",
+        "input_schema": {"topic": "string"},
+    },
+}
+
+INVENTORY = {
+    "laptop": {"stock": 18, "reorder_level": 10, "warehouse": "Bengaluru"},
+    "keyboard": {"stock": 7, "reorder_level": 12, "warehouse": "Pune"},
+    "monitor": {"stock": 0, "reorder_level": 5, "warehouse": "Hyderabad"},
+}
+
+COUNTRY_DATA = {
+    "india": {"capital": "New Delhi", "currency": "Indian Rupee", "region": "Asia"},
+    "japan": {"capital": "Tokyo", "currency": "Japanese Yen", "region": "Asia"},
+    "germany": {"capital": "Berlin", "currency": "Euro", "region": "Europe"},
+}
+
+BOOK_DATA = {
+    "artificial intelligence": ["Artificial Intelligence: A Modern Approach", "Life 3.0"],
+    "python": ["Fluent Python", "Automate the Boring Stuff with Python"],
+    "agents": ["Designing Multi-Agent Systems", "AI Agents in Action"],
+}
+
+WEATHER_DATA = {
+    "bengaluru": {"temperature_c": 26, "condition": "Partly cloudy", "humidity": 68},
+    "pune": {"temperature_c": 29, "condition": "Cloudy", "humidity": 61},
+    "delhi": {"temperature_c": 34, "condition": "Hazy", "humidity": 55},
+}
+
+
+def _event(step: int, actor: str, action: str, detail: str, payload: Dict[str, Any]) -> MCPEvent:
+    return MCPEvent(
+        step=step,
+        actor=actor,
+        action=action,
+        detail=detail,
+        payload=payload,
+        timestamp=datetime.now().strftime("%H:%M:%S"),
+    )
+
+
+def execute_local_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    if tool_name == "read_inventory":
+        product = str(arguments.get("product", "")).strip().lower()
+        item = INVENTORY.get(product)
+        if not item:
+            return {"status": "not_found", "message": f"No local inventory record for '{product}'."}
+        status = "Reorder" if item["stock"] <= item["reorder_level"] else "Healthy"
+        return {"product": product.title(), **item, "status": status}
+
+    if tool_name == "calculate_bmi":
+        weight = float(arguments.get("weight_kg", 0))
+        height_cm = float(arguments.get("height_cm", 0))
+        if weight <= 0 or height_cm <= 0:
+            return {"status": "error", "message": "Weight and height must be positive."}
+        bmi = weight / ((height_cm / 100) ** 2)
+        category = "Underweight" if bmi < 18.5 else "Healthy" if bmi < 25 else "Overweight" if bmi < 30 else "Obesity range"
+        return {"bmi": round(bmi, 2), "category": category}
+
+    if tool_name == "summarize_notes":
+        notes = str(arguments.get("notes", "")).strip()
+        if not notes:
+            return {"status": "error", "message": "No notes were supplied."}
+        sentences = [s.strip() for s in notes.replace("\n", " ").split(".") if s.strip()]
+        return {
+            "summary": ". ".join(sentences[:2]) + ("." if sentences else ""),
+            "action_items_detected": [s for s in sentences if any(k in s.lower() for k in ["action", "send", "prepare", "complete", "follow up"])],
+        }
+
+    return {"status": "error", "message": "Unknown local tool."}
+
+
+def execute_remote_tool(tool_name: str, arguments: Dict[str, Any], latency_ms: int = 650, fail_rate: int = 0) -> Dict[str, Any]:
+    time.sleep(max(latency_ms, 0) / 1000)
+    if random.randint(1, 100) <= fail_rate:
+        return {"status": "remote_error", "message": "The remote MCP server returned a simulated 503 error."}
+
+    if tool_name == "get_weather":
+        city = str(arguments.get("city", "")).strip().lower()
+        return {"city": city.title(), **WEATHER_DATA.get(city, {"temperature_c": 28, "condition": "Data simulated", "humidity": 60})}
+
+    if tool_name == "lookup_country":
+        country = str(arguments.get("country", "")).strip().lower()
+        data = COUNTRY_DATA.get(country)
+        return {"country": country.title(), **data} if data else {"status": "not_found", "message": f"No sample record for '{country}'."}
+
+    if tool_name == "search_books":
+        topic = str(arguments.get("topic", "")).strip().lower()
+        books = BOOK_DATA.get(topic, [f"Introduction to {topic.title()}", f"Practical {topic.title()}"])
+        return {"topic": topic.title(), "books": books, "source": "Remote MCP sample catalog"}
+
+    return {"status": "error", "message": "Unknown remote tool."}
+
+
+def build_trace(mode: str, user_request: str, tool_name: str, arguments: Dict[str, Any], result: Dict[str, Any], include_auth: bool = False) -> List[Dict[str, Any]]:
+    is_remote = mode == "remote"
+    steps: List[MCPEvent] = [
+        _event(1, "User", "Submit request", user_request, {"message": user_request}),
+        _event(2, "AI Agent", "Interpret intent", f"The agent decides that '{tool_name}' can satisfy the request.", {"selected_tool": tool_name}),
+        _event(3, "MCP Client", "List tools", "The MCP client discovers tools exposed by the server.", {"method": "tools/list", "transport": "HTTPS/SSE" if is_remote else "stdio"}),
+    ]
+    step = 4
+    if is_remote and include_auth:
+        steps.append(_event(step, "MCP Client", "Attach authentication", "A bearer token is added before contacting the remote server.", {"authorization": "Bearer ••••••••"}))
+        step += 1
+    steps.extend([
+        _event(step, "MCP Client", "Call tool", f"Arguments are validated against the tool input schema.", {"method": "tools/call", "name": tool_name, "arguments": arguments}),
+        _event(step + 1, "MCP Server", "Execute tool", "The server runs the requested capability and returns structured content.", {"result": result}),
+        _event(step + 2, "AI Agent", "Generate response", "The agent converts the structured result into a user-friendly answer.", {"grounded_in": "MCP tool result"}),
+    ])
+    return [asdict(item) for item in steps]
+
+
+def pretty_json(data: Any) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+# MCP Agent Playground
+
+A creative Streamlit learning application that demonstrates how AI agents use the Model Context Protocol (MCP).
+
+## What the app includes
+
+- Local MCP playground using a simulated `stdio` flow
+- Remote MCP playground using a simulated HTTP/SSE flow
+- Interactive tool discovery and tool execution
+- Raw MCP-style request and response payloads
+- Authentication, latency, and failure simulation
+- Architecture diagrams and execution traces
+- Optional OpenAI-generated beginner explanations
+- Local vs remote comparison and quiz
+
+## Project files
+
+```text
+mcp_agent_playground/
+├── app.py
+├── mcp_simulator.py
+├── requirements.txt
+├── .env
+├── .env.example
+└── README.md
+```
+
+## Run the application
+
+```bash
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# macOS/Linux
+source .venv/bin/activate
+
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## Optional OpenAI setup
+
+Copy `.env.example` to `.env` and add your key:
+
+```env
+OPENAI_API_KEY=your_openai_api_key_here
+```
+
+The application works without an OpenAI key. The key is used only for an optional AI explanation of the MCP trace.
+
+## Training note
+
+This application is an educational simulator. It models the important MCP concepts—agent, client, server, tools, transport, authentication, and structured results—without requiring participants to configure a production MCP server.
+
+streamlit>=1.36.0
+python-dotenv>=1.0.1
+openai>=1.40.0
+graphviz>=0.20.3
