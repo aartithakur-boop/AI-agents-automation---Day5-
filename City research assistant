@@ -1,0 +1,1110 @@
+  """
+app.py
+Streamlit UI for the City Research Assistant.
+
+Run with:
+    streamlit run app.py
+"""
+
+import datetime
+import pandas as pd
+import streamlit as st
+
+import config
+from llm_service import get_model
+from coordinator_agent import extract_request
+from research_orchestrator import run_research_parallel, AGENT_REGISTRY
+from comparison_agent import compare_cities
+from utils import safe_json_dumps
+
+
+st.set_page_config(
+    page_title=config.APP_TITLE, page_icon=config.APP_ICON,
+    layout="wide", initial_sidebar_state="expanded",
+)
+
+st.markdown("""
+<style>
+    .main-header {
+        padding: 1.4rem 1.6rem;
+        background: linear-gradient(135deg, #7c2d12 0%, #9a3412 100%);
+        border-radius: 12px; margin-bottom: 1.2rem; color: white;
+    }
+    .main-header h1 { margin: 0; font-size: 1.7rem; }
+    .main-header p { margin: 0.3rem 0 0 0; opacity: 0.9; font-size: 0.95rem; }
+    .agent-card { border-radius: 10px; padding: 0.7rem 0.6rem; text-align: center; border: 1px solid #e2e8f0; font-size: 0.8rem; }
+    .agent-pending { background: #f8fafc; color: #94a3b8; }
+    .agent-done { background: #ecfdf5; color: #065f46; border-color: #10b981; }
+    .agent-error { background: #fef2f2; color: #991b1b; border-color: #ef4444; }
+    .status-ok { color: #065f46; background: #ecfdf5; border: 1px solid #10b981; border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.85rem; }
+    .status-bad { color: #991b1b; background: #fef2f2; border: 1px solid #ef4444; border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.85rem; }
+</style>
+""", unsafe_allow_html=True)
+
+
+def init_session_state():
+    defaults = {
+        "chat_history": [], "coordinator_info": None, "research_output": None,
+        "comparison_result": None, "stage": "idle",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+init_session_state()
+
+
+def reset_all():
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    init_session_state()
+
+
+with st.sidebar:
+    st.markdown(f"## {config.APP_ICON} Settings")
+
+    if config.is_openai_configured():
+        st.markdown('<div class="status-ok">✅ OpenAI API Key: Configured</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="status-bad">⚠️ OpenAI API Key: Missing</div>', unsafe_allow_html=True)
+
+    if config.is_tavily_configured():
+        st.markdown('<div class="status-ok">✅ Tavily API Key: Configured</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="status-bad">⚠️ Tavily API Key: Missing (Web Research Agent will be skipped)</div>', unsafe_allow_html=True)
+
+    st.divider()
+    selected_model = st.selectbox("Model", options=config.AVAILABLE_MODELS, index=0)
+    temperature = st.slider("Temperature", 0.0, 1.0, config.DEFAULT_TEMPERATURE, 0.05)
+
+    st.divider()
+    st.markdown("### 🤖 Agent Architecture")
+    st.caption(
+        "1. Coordinator Agent (LLM)\n"
+        "2. Amenities Agent — OpenStreetMap\n"
+        "3. Weather Agent — Open-Meteo\n"
+        "4. Web Research Agent — Tavily\n"
+        "5. Book Recommendation Agent — Open Library\n"
+        "   *(2–5 run in parallel)*\n"
+        "6. Comparison Agent (LLM)"
+    )
+
+    st.divider()
+    if st.button("🔄 New Comparison", use_container_width=True):
+        reset_all()
+        st.rerun()
+
+
+st.markdown(f"""
+<div class="main-header">
+    <h1>{config.APP_ICON} {config.APP_TITLE}</h1>
+    <p>{config.APP_SUBTITLE} — ask a question like "Should I move to Pune or Bengaluru?"</p>
+</div>
+""", unsafe_allow_html=True)
+
+for turn in st.session_state.chat_history:
+    with st.chat_message(turn["role"]):
+        st.markdown(turn["content"])
+
+user_question = st.chat_input("e.g. Should I move to Pune or Bengaluru? I'm a software engineer.")
+
+if user_question:
+    st.session_state.chat_history.append({"role": "user", "content": user_question})
+    with st.chat_message("user"):
+        st.markdown(user_question)
+
+    if not config.is_openai_configured():
+        st.error("⚠️ OpenAI API key is not configured. Please set OPENAI_API_KEY in your .env file.")
+    else:
+        try:
+            model = get_model(model_id=selected_model, temperature=temperature)
+
+            # --- Step 1: Coordinator Agent ---
+            with st.status("🧭 Coordinator Agent — extracting cities & priorities...", expanded=True) as status:
+                coordinator_info = extract_request(model, user_question)
+                st.session_state.coordinator_info = coordinator_info
+                city_a, city_b = coordinator_info["city_a"], coordinator_info["city_b"]
+                st.write(f"**Comparing:** {city_a} vs {city_b}")
+                if coordinator_info.get("priorities"):
+                    st.write(f"**Priorities:** {', '.join(coordinator_info['priorities'])}")
+                status.update(label="✅ Coordinator Agent complete", state="complete")
+
+            # --- Step 2: Four research agents in parallel ---
+            st.markdown(f"### ⚙️ Researching {city_a} vs {city_b}")
+            cards_placeholder = st.empty()
+            log_placeholder = st.empty()
+
+            agent_state = {key: {city_a: "pending", city_b: "pending"} for key in AGENT_REGISTRY}
+
+            def render_cards():
+                with cards_placeholder.container():
+                    cols = st.columns(len(AGENT_REGISTRY))
+                    for col, (key, info) in zip(cols, AGENT_REGISTRY.items()):
+                        statuses = agent_state[key]
+                        overall = "error" if "error" in statuses.values() else (
+                            "done" if all(s == "done" for s in statuses.values()) else "pending"
+                        )
+                        col.markdown(f"<div class='agent-card agent-{overall}'>{info['display_name']}</div>", unsafe_allow_html=True)
+
+            render_cards()
+            collected_log = []
+
+            def on_progress(event):
+                outcome = event["outcome"]
+                agent_state[outcome["agent_key"]][outcome["city"]] = "done" if outcome["status"] == "success" else "error"
+                collected_log.append(event["log_entry"])
+                render_cards()
+                log_placeholder.markdown("\n".join(
+                    f"`{e['timestamp']}` **{e['agent']}** — {e['message']}" for e in collected_log[-8:]
+                ))
+
+            research_output = run_research_parallel(city_a, city_b, progress_callback=on_progress)
+            st.session_state.research_output = research_output
+            st.success("✅ All research agents completed")
+
+            # --- Step 3: Comparison Agent ---
+            with st.status("⚖️ Comparison Agent — synthesizing recommendation...", expanded=True) as status:
+                comparison_result = compare_cities(
+                    model, user_question, coordinator_info, research_output["results"]
+                )
+                st.session_state.comparison_result = comparison_result
+                status.update(label="✅ Comparison Agent complete", state="complete")
+
+            summary_text = comparison_result.get("recommendation", "")
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": f"**{comparison_result.get('summary', '')}**\n\n{summary_text}"
+            })
+
+        except Exception as e:
+            error_text = f"❌ {str(e)}"
+            st.error(error_text)
+            st.session_state.chat_history.append({"role": "assistant", "content": error_text})
+
+
+# ----------------------------------------------------------------------------
+# Results dashboard
+# ----------------------------------------------------------------------------
+if st.session_state.comparison_result and st.session_state.coordinator_info:
+    coordinator_info = st.session_state.coordinator_info
+    research_output = st.session_state.research_output
+    comparison = st.session_state.comparison_result
+    city_a, city_b = coordinator_info["city_a"], coordinator_info["city_b"]
+
+    st.markdown("---")
+    st.markdown(f"### 📊 {city_a} vs {city_b}")
+
+    tabs = st.tabs([
+        "🏁 Recommendation", "🏥 Amenities", "🌤️ Weather",
+        "🔎 Research", "📚 Books", "🪵 Execution Log",
+    ])
+
+    with tabs[0]:
+        st.info(f"**Confidence:** {comparison.get('confidence', 'Unknown')}")
+        st.markdown(f"**Summary:** {comparison.get('summary', '')}")
+        st.markdown(f"### 🎯 Recommendation\n{comparison.get('recommendation', '')}")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"**Advantages — {city_a}**")
+            for point in comparison.get(f"advantages_{city_a}", []):
+                st.markdown(f"- {point}")
+        with col2:
+            st.markdown(f"**Advantages — {city_b}**")
+            for point in comparison.get(f"advantages_{city_b}", []):
+                st.markdown(f"- {point}")
+
+        if comparison.get("category_scores"):
+            st.markdown("**Category Comparison**")
+            st.dataframe(pd.DataFrame(comparison["category_scores"]).T, use_container_width=True)
+
+        if comparison.get("limitations"):
+            st.warning("**Limitations / missing data:**\n" + "\n".join(f"- {l}" for l in comparison["limitations"]))
+
+    with tabs[1]:
+        col1, col2 = st.columns(2)
+        for col, city in zip((col1, col2), (city_a, city_b)):
+            outcome = research_output["results"]["amenities"].get(city, {})
+            with col:
+                st.markdown(f"**{city}**")
+                if outcome.get("status") == "success":
+                    counts = outcome["result"].get("amenity_counts", {})
+                    st.dataframe(pd.DataFrame(list(counts.items()), columns=["Amenity", "Count"]), use_container_width=True, hide_index=True)
+                else:
+                    st.error(f"Unavailable: {outcome.get('error', 'unknown error')}")
+
+    with tabs[2]:
+        col1, col2 = st.columns(2)
+        for col, city in zip((col1, col2), (city_a, city_b)):
+            outcome = research_output["results"]["weather"].get(city, {})
+            with col:
+                st.markdown(f"**{city}**")
+                if outcome.get("status") == "success":
+                    current = outcome["result"].get("current", {})
+                    st.json(current, expanded=True)
+                    st.markdown("5-day forecast:")
+                    st.json(outcome["result"].get("five_day_forecast", {}), expanded=False)
+                else:
+                    st.error(f"Unavailable: {outcome.get('error', 'unknown error')}")
+
+    with tabs[3]:
+        col1, col2 = st.columns(2)
+        for col, city in zip((col1, col2), (city_a, city_b)):
+            outcome = research_output["results"]["web_research"].get(city, {})
+            with col:
+                st.markdown(f"**{city}**")
+                if outcome.get("status") == "success":
+                    topics = outcome["result"].get("topics", {})
+                    for topic, items in topics.items():
+                        with st.expander(topic.replace("_", " ").title()):
+                            if isinstance(items, list):
+                                for item in items:
+                                    st.markdown(f"- [{item.get('title')}]({item.get('url')}) — {item.get('snippet', '')[:150]}...")
+                            else:
+                                st.caption(str(items))
+                else:
+                    st.error(f"Unavailable: {outcome.get('error', 'unknown error')}")
+
+    with tabs[4]:
+        col1, col2 = st.columns(2)
+        for col, city in zip((col1, col2), (city_a, city_b)):
+            outcome = research_output["results"]["books"].get(city, {})
+            with col:
+                st.markdown(f"**{city}**")
+                if outcome.get("status") == "success":
+                    for book in outcome["result"].get("books", []):
+                        st.markdown(f"- **{book['title']}** by {book['author']} ({book.get('first_publish_year', 'n/a')})")
+                else:
+                    st.error(f"Unavailable: {outcome.get('error', 'unknown error')}")
+
+    with tabs[5]:
+        st.dataframe(pd.DataFrame(research_output["execution_log"]), use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Download Full Results (JSON)",
+            data=safe_json_dumps({"coordinator": coordinator_info, "research": research_output["results"], "comparison": comparison}),
+            file_name=f"city_comparison_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+        )
+
+"""
+comparison_agent.py
+The Comparison Agent from the architecture diagram. Takes the structured
+results from all four research agents (never raw model knowledge) and
+produces a side-by-side comparison, category scores, pros/cons, and a
+final recommendation — explicitly instructed not to invent unavailable
+numerical values, and to disclose data limitations honestly.
+"""
+
+from typing import Any, Dict
+
+from smolagents import ToolCallingAgent
+
+import prompts
+from utils import extract_json_object, safe_json_dumps
+
+
+def compare_cities(
+    model,
+    user_question: str,
+    coordinator_info: Dict[str, Any],
+    research_results: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Runs the Comparison Agent once and returns a structured comparison dict.
+    `research_results` is the {agent_key: {city: outcome}} structure produced
+    by research_orchestrator.run_research_parallel().
+    """
+    city_a = coordinator_info["city_a"]
+    city_b = coordinator_info["city_b"]
+
+    def _city_payload(city: str) -> str:
+        payload = {}
+        for agent_key, per_city in research_results.items():
+            outcome = per_city.get(city, {})
+            payload[agent_key] = outcome.get("result") if outcome.get("status") == "success" else {
+                "error": outcome.get("error", "No data available")
+            }
+        return safe_json_dumps(payload)
+
+    task = prompts.COMPARISON_SYSTEM_PROMPT.format(
+        user_question=user_question,
+        priorities=", ".join(coordinator_info.get("priorities", [])) or "not specified",
+        city_a=city_a, city_b=city_b,
+        city_a_key=city_a, city_b_key=city_b,
+        city_a_data=_city_payload(city_a),
+        city_b_data=_city_payload(city_b),
+    )
+
+    agent = ToolCallingAgent(tools=[], model=model, max_steps=3, verbosity_level=0)
+    raw_result = agent.run(task)
+    parsed = extract_json_object(str(raw_result))
+
+    if not parsed:
+        raise ValueError("The Comparison Agent did not return a valid structured comparison. Please try again.")
+
+    parsed.setdefault("summary", "")
+    parsed.setdefault("category_scores", {})
+    parsed.setdefault(f"advantages_{city_a}", [])
+    parsed.setdefault(f"advantages_{city_b}", [])
+    parsed.setdefault("recommendation", "")
+    parsed.setdefault("confidence", "Unknown")
+    parsed.setdefault("limitations", [])
+
+    return parsed
+
+"""
+config.py
+Centralized configuration loader. Loads environment variables from .env
+and exposes them as simple constants. Never hardcodes or displays keys.
+"""
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+AVAILABLE_MODELS = [
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4-turbo",
+]
+
+DEFAULT_TEMPERATURE = 0.2
+
+APP_TITLE = "City Research Assistant"
+APP_SUBTITLE = "Compare two cities before relocating"
+APP_ICON = "🏙️"
+
+# --- External API endpoints (all free / keyless except Tavily) ---
+NOMINATIM_BASE_URL = "https://nominatim.openstreetmap.org"
+OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+OPEN_LIBRARY_SEARCH_URL = "https://openlibrary.org/search.json"
+
+REQUEST_TIMEOUT_SECONDS = 15
+REQUEST_HEADERS = {"User-Agent": "city-research-assistant/1.0 (educational project)"}
+
+AMENITY_QUERIES = {
+    "hospitals": "hospital",
+    "schools": "school",
+    "railway_stations": "railway station",
+    "bus_stations": "bus station",
+    "parks": "park",
+    "restaurants": "restaurant",
+    "supermarkets": "supermarket",
+    "coworking_spaces": "coworking space",
+}
+
+TAVILY_RESEARCH_TOPICS = {
+    "cost_of_living": "cost of living in {city} 2026",
+    "job_market": "job market and major industries in {city}",
+    "rental_prices": "average rental prices in {city}",
+    "traffic_and_commute": "traffic conditions and average commute time in {city}",
+    "safety_and_lifestyle": "safety and lifestyle in {city}",
+}
+
+
+def is_openai_configured() -> bool:
+    return bool(OPENAI_API_KEY and OPENAI_API_KEY.strip() and OPENAI_API_KEY != "your_openai_api_key_here")
+
+
+def is_tavily_configured() -> bool:
+    return bool(TAVILY_API_KEY and TAVILY_API_KEY.strip() and TAVILY_API_KEY != "your_tavily_api_key_here")
+
+"""
+coordinator_agent.py
+The Coordinator Agent from the architecture diagram. Uses a Smolagents
+`ToolCallingAgent` (no tools of its own — it's a pure reasoning step) to
+read the user's free-text question and extract: which two cities, and
+what the user's stated priorities/profession/climate/family/budget
+preferences are. Answers in structured JSON, which we parse defensively.
+"""
+
+from typing import Any, Dict
+
+from smolagents import ToolCallingAgent
+
+import prompts
+from utils import extract_json_object
+
+REQUIRED_FIELDS = [
+    "city_a", "city_b", "priorities", "profession",
+    "climate_preference", "family_requirements", "budget_expectations",
+]
+
+
+def extract_request(model, user_message: str) -> Dict[str, Any]:
+    """
+    Runs the Coordinator Agent once and returns a structured dict.
+    Raises ValueError if the two cities cannot be determined at all.
+    """
+    agent = ToolCallingAgent(tools=[], model=model, max_steps=3, verbosity_level=0)
+    task = prompts.COORDINATOR_SYSTEM_PROMPT.format(user_message=user_message)
+
+    raw_result = agent.run(task)
+    parsed = extract_json_object(str(raw_result))
+
+    if not parsed:
+        raise ValueError(
+            "The Coordinator Agent could not extract structured information from your question. "
+            "Try phrasing it like: 'Should I move to Pune or Bengaluru?'"
+        )
+
+    for field in REQUIRED_FIELDS:
+        parsed.setdefault(field, "" if field != "priorities" else [])
+
+    if not parsed.get("city_a") or not parsed.get("city_b"):
+        raise ValueError(
+            "Could not identify two cities to compare. Please mention both city names, "
+            "e.g. 'Should I move to Pune or Bengaluru?'"
+        )
+
+    return parsed
+
+"""
+llm_service.py
+Wraps creation of the Smolagents OpenAIServerModel — the model wrapper
+used by the Coordinator and Comparison agents. The API key is read only
+from the environment (via config.py) and is never hardcoded or displayed.
+Data-fetching tools (tools.py) never touch this — they are pure Python.
+"""
+
+from smolagents import OpenAIServerModel
+
+from config import OPENAI_API_KEY, DEFAULT_MODEL, DEFAULT_TEMPERATURE
+
+
+def get_model(model_id: str = DEFAULT_MODEL, temperature: float = DEFAULT_TEMPERATURE) -> OpenAIServerModel:
+    if not OPENAI_API_KEY:
+        raise ValueError(
+            "OPENAI_API_KEY is not set. Please add it to your .env file. "
+            "See .env.example for the expected format."
+        )
+    return OpenAIServerModel(
+        model_id=model_id,
+        api_key=OPENAI_API_KEY,
+        client_kwargs={"timeout": 60},
+        temperature=temperature,
+    )
+
+"""
+prompts.py
+Prompt templates for the two places an LLM is actually used: the
+Coordinator Agent (extracts cities + priorities from free text) and the
+Comparison Agent (synthesizes the final recommendation). Both are
+instructed to answer in strict JSON so the app can parse a structured
+result reliably.
+"""
+
+COORDINATOR_SYSTEM_PROMPT = """You are the Coordinator Agent in a city-relocation research assistant.
+Read the user's message and extract structured information from it.
+
+Respond with ONLY a JSON object (no other text, no markdown fences) in
+exactly this shape:
+
+{{
+  "city_a": "<first city name, properly capitalized>",
+  "city_b": "<second city name, properly capitalized>",
+  "priorities": ["<priority1>", "<priority2>", ...],
+  "profession": "<profession/job field if mentioned, else empty string>",
+  "climate_preference": "<climate preference if mentioned, else empty string>",
+  "family_requirements": "<family-related requirements if mentioned, else empty string>",
+  "budget_expectations": "<budget info if mentioned, else empty string>"
+}}
+
+Priorities should be chosen from things like: jobs, cost of living, weather,
+schools, healthcare, safety, commute, lifestyle, culture — pick whichever
+are implied or stated, in the order of apparent importance. If the user
+did not clearly mention two cities, still do your best to infer them or
+leave the field as an empty string if truly not present.
+
+User's message:
+{user_message}
+"""
+
+COMPARISON_SYSTEM_PROMPT = """You are the Comparison Agent in a city-relocation research assistant.
+You are given structured research data (never raw model knowledge) about
+two cities, gathered by specialized data-fetching agents: amenities,
+weather, web research (cost of living, jobs, safety, etc.), and book
+recommendations. Some fields may be missing or show errors — that is
+expected; DO NOT invent numbers or facts that are not present in the data.
+
+User's original question: {user_question}
+User's stated priorities: {priorities}
+
+Research data for {city_a}:
+{city_a_data}
+
+Research data for {city_b}:
+{city_b_data}
+
+Respond with ONLY a JSON object (no other text, no markdown fences) in
+exactly this shape:
+
+{{
+  "summary": "<2-3 sentence overview comparing the two cities>",
+  "category_scores": {{
+     "amenities": {{"{city_a}": "<Higher/Lower/Similar/Unknown>", "{city_b}": "<Higher/Lower/Similar/Unknown>"}},
+     "weather": {{"{city_a}": "<description>", "{city_b}": "<description>"}},
+     "cost_of_living": {{"{city_a}": "<Higher/Lower/Similar/Unknown>", "{city_b}": "<Higher/Lower/Similar/Unknown>"}},
+     "jobs": {{"{city_a}": "<summary>", "{city_b}": "<summary>"}},
+     "safety_lifestyle": {{"{city_a}": "<summary>", "{city_b}": "<summary>"}}
+  }},
+  "advantages_{city_a_key}": ["<point1>", "<point2>", "..."],
+  "advantages_{city_b_key}": ["<point1>", "<point2>", "..."],
+  "recommendation": "<clear recommendation, referencing the user's stated priorities>",
+  "confidence": "<High/Medium/Low, based on how complete the underlying data was>",
+  "limitations": ["<any missing data or caveats the user should know about>"]
+}}
+"""
+
+# 🏙️ City Research Assistant
+
+A beginner-friendly Streamlit application that helps users compare two cities
+before relocating — e.g. "Should I move to Pune or Bengaluru?" — using
+**Smolagents** for multi-agent orchestration and 4 real, free data APIs.
+
+---
+
+## 🏗️ Agent Architecture
+
+```
+                            User
+                             │
+                             ▼
+                  Streamlit Chat Interface
+                             │
+                             ▼
+                   Coordinator Agent (LLM)
+                             │
+           ┌────────────────┼────────────────┬────────────────┐
+           ▼                ▼                ▼                ▼
+   Amenities Agent    Weather Agent   Web Research Agent  Book Rec. Agent
+           │                │                │                │
+           ▼                ▼                ▼                ▼
+  OpenStreetMap/Nominatim  Open-Meteo      Tavily API      Open Library API
+           │                │                │                │
+           └────────────────┴───── (run in TRUE parallel) ────┘
+                             │
+                             ▼
+                    Comparison Agent (LLM)
+                             │
+                             ▼
+              Final City Recommendation
+```
+
+**Only two steps use an LLM**: the Coordinator (extracting cities/priorities
+from your question) and the Comparison Agent (synthesizing the final
+recommendation). The four research agents are pure Python/`requests` calls
+against real APIs — they never call an LLM, and the Comparison Agent is
+explicitly instructed never to invent numbers that aren't in the data it
+was given.
+
+---
+
+## 📁 Project Structure
+
+```
+city_research_assistant/
+├── app.py                  # Streamlit UI — entry point
+├── config.py                # Environment/config loader, API endpoints
+├── llm_service.py             # Smolagents OpenAIServerModel factory
+├── tools.py                  # 4 Smolagents Tool classes — pure Python, NO LLM
+├── research_orchestrator.py    # Runs all 4 tools for both cities in parallel
+├── coordinator_agent.py        # Smolagents agent: extracts cities & priorities
+├── comparison_agent.py         # Smolagents agent: final comparison + recommendation
+├── prompts.py                 # Prompt templates for both LLM agents
+├── utils.py                   # Logging + robust JSON-extraction helpers
+├── requirements.txt
+├── .env                      # Your local secrets (not committed)
+├── .env.example
+├── .gitignore
+└── README.md
+```
+
+---
+
+## 🛠️ The Four Research Agents
+
+| Agent | Data Source | What it fetches |
+|---|---|---|
+| Amenities Agent | OpenStreetMap / Nominatim | Hospital, school, railway/bus station, park, restaurant, supermarket, and coworking-space counts |
+| Weather Agent | Open-Meteo | Current temperature/humidity/wind + 5-day forecast |
+| Web Research Agent | Tavily API | Cost of living, job market, rental prices, traffic/commute, safety & lifestyle |
+| Book Recommendation Agent | Open Library | Books related to the city's history, culture, and travel |
+
+All four run **concurrently** (via a thread pool) for **both cities at
+once** — 8 total requests in parallel, not sequential.
+
+---
+
+## ⚙️ Installation
+
+```bash
+cd city_research_assistant
+python -m venv venv
+venv\Scripts\activate        # Windows
+source venv/bin/activate     # macOS/Linux
+pip install -r requirements.txt
+```
+
+---
+
+## 🔑 Configuration
+
+This project needs **two** API keys (not one):
+
+```
+OPENAI_API_KEY=your_openai_api_key_here
+OPENAI_MODEL=gpt-4o-mini
+TAVILY_API_KEY=your_tavily_api_key_here
+```
+
+- OpenAI key: https://platform.openai.com/api-keys
+- Tavily key: https://tavily.com (free tier available)
+
+If `TAVILY_API_KEY` is missing, the app still runs — the Web Research
+Agent simply reports it's unavailable, and the Comparison Agent notes
+this as a limitation rather than guessing.
+
+OpenStreetMap/Nominatim, Open-Meteo, and Open Library need **no API key**.
+
+---
+
+## ▶️ Running the App
+
+```bash
+streamlit run app.py
+```
+
+Open the local URL Streamlit prints (usually `http://localhost:8501`).
+
+---
+
+## 🧪 Using the App
+
+1. Type a question like *"Should I move to Pune or Bengaluru? I'm a
+   software engineer and prefer milder weather."*
+2. Watch the **Coordinator Agent** extract both city names and your
+   stated priorities.
+3. Watch the **4 research agent cards** turn from pending → done (or
+   error) as they fetch real data in parallel.
+4. Watch the **Comparison Agent** synthesize a final recommendation.
+5. Explore the tabs: Recommendation, Amenities, Weather, Research,
+   Books, and the full Execution Log.
+6. Download the complete results as JSON if needed.
+
+---
+
+## 🧠 Design Notes
+
+- **Structured, not invented, data** — every research tool returns a
+  plain Python dict built directly from its API's JSON response. The
+  Comparison Agent is explicitly told: don't invent unavailable numbers,
+  and disclose missing data as a limitation instead of guessing.
+- **True parallelism** — the 4 agents × 2 cities = 8 tasks run on a
+  thread pool (`concurrent.futures.ThreadPoolExecutor`), not one after
+  another, so the wait time is roughly the slowest single agent, not the
+  sum of all of them.
+- **Smolagents for the two reasoning steps** — the Coordinator and
+  Comparison agents are built with `smolagents.ToolCallingAgent`, each
+  instructed to answer in strict JSON, which the app parses defensively
+  (handling markdown-fenced or slightly-off-format responses) via
+  `utils.extract_json_object`.
+- **Graceful partial failure** — if one agent fails for one city (e.g. a
+  geocoding miss, or Tavily being unconfigured), the rest of the pipeline
+  still completes, and the Comparison Agent is shown exactly which pieces
+  of data are missing so it can factor that into its confidence level.
+
+---
+
+## 🛡️ Error Handling
+
+- **Missing API keys** — clearly flagged in the sidebar; the app refuses
+  to run the LLM steps without `OPENAI_API_KEY`, but the Tavily-dependent
+  agent simply degrades gracefully if `TAVILY_API_KEY` is missing.
+- **Unrecognized/ambiguous cities** — the Coordinator Agent raises a
+  clear error asking the user to rephrase if it can't identify two cities.
+- **Per-agent API failures** — caught individually (a failed geocode for
+  one city doesn't crash the whole run); shown in the Execution Log and
+  in each dashboard tab.
+- **Malformed LLM JSON** — defensively parsed via regex/fence-stripping
+  before falling back to a clear error message.
+
+---
+
+## 🛠️ Tech Stack
+
+- [Streamlit](https://streamlit.io/) — UI
+- [Smolagents](https://github.com/huggingface/smolagents) — `ToolCallingAgent`, `Tool`, `OpenAIServerModel`
+- [OpenAI API](https://platform.openai.com/) — Coordinator + Comparison reasoning
+- [Tavily API](https://tavily.com/) — web research
+- [OpenStreetMap / Nominatim](https://nominatim.org/) — amenities & geocoding
+- [Open-Meteo](https://open-meteo.com/) — weather (no key required)
+- [Open Library](https://openlibrary.org/developers/api) — book recommendations (no key required)
+- [Pandas](https://pandas.pydata.org/) — dashboard tables
+
+---
+
+## 🧯 Troubleshooting
+
+| Issue | Fix |
+|---|---|
+| "OpenAI API key is not configured" | Set `OPENAI_API_KEY` in `.env`, then restart Streamlit |
+| Web Research tab always shows an error | Set `TAVILY_API_KEY` in `.env` — get one free at tavily.com |
+| "Could not identify two cities" | Mention both city names explicitly, e.g. "Pune or Bengaluru" |
+| Amenity counts seem low/off | Nominatim's search-based counting is approximate, not an exact census — this is disclosed in the tool's own output |
+| `ModuleNotFoundError` | Run `pip install -r requirements.txt` again inside your active virtual environment |
+
+---
+
+## 📄 License
+
+This project is provided as-is for educational/demo purposes.
+
+streamlit>=1.37.0
+smolagents
+openai>=1.40.0
+requests>=2.31.0
+pandas>=2.2.0
+python-dotenv>=1.0.1
+
+"""
+research_orchestrator.py
+Runs the four specialized research tools — Amenities, Weather, Web
+Research, and Book Recommendations — for BOTH cities, in TRUE parallel
+using a thread pool. This is the "Multiple specialized agents perform
+these research tasks in parallel" step from the architecture.
+
+Each tool call is deterministic Python (see tools.py) — no LLM involved
+here. Every result (or per-agent error) is captured into a structured
+dict so the UI can show exactly what succeeded/failed, per agent, per
+city, without ever inventing missing data.
+"""
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, List
+
+from tools import AmenitiesTool, WeatherTool, TavilyResearchTool, OpenLibraryTool
+from utils import make_log_entry
+
+AGENT_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "amenities": {"display_name": "Amenities Agent", "tool_cls": AmenitiesTool},
+    "weather": {"display_name": "Weather Agent", "tool_cls": WeatherTool},
+    "web_research": {"display_name": "Web Research Agent", "tool_cls": TavilyResearchTool},
+    "books": {"display_name": "Book Recommendation Agent", "tool_cls": OpenLibraryTool},
+}
+
+
+def _run_single(agent_key: str, city: str) -> Dict[str, Any]:
+    """Runs one agent's tool for one city, capturing success or failure."""
+    display_name = AGENT_REGISTRY[agent_key]["display_name"]
+    tool = AGENT_REGISTRY[agent_key]["tool_cls"]()
+    try:
+        result = tool.forward(city)
+        return {
+            "agent_key": agent_key, "agent_name": display_name, "city": city,
+            "status": "success", "result": result, "error": None,
+        }
+    except Exception as e:
+        return {
+            "agent_key": agent_key, "agent_name": display_name, "city": city,
+            "status": "error", "result": None, "error": str(e),
+        }
+
+
+def run_research_parallel(
+    city_a: str,
+    city_b: str,
+    progress_callback: Callable[[Dict[str, Any]], None] | None = None,
+) -> Dict[str, Any]:
+    """
+    Runs all 4 agents for both cities concurrently (8 total tasks).
+    `progress_callback`, if given, is called once per completed task —
+    used by app.py to update the live agent-status UI as results land.
+
+    Returns:
+        {
+          "results": { agent_key: { city_a: {...}, city_b: {...} } },
+          "execution_log": [ ... ],
+        }
+    """
+    tasks = []
+    for agent_key in AGENT_REGISTRY:
+        for city in (city_a, city_b):
+            tasks.append((agent_key, city))
+
+    results: Dict[str, Dict[str, Any]] = {key: {} for key in AGENT_REGISTRY}
+    execution_log: List[Dict[str, Any]] = []
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_task = {executor.submit(_run_single, key, city): (key, city) for key, city in tasks}
+        for future in as_completed(future_to_task):
+            agent_key, city = future_to_task[future]
+            outcome = future.result()
+            results[agent_key][city] = outcome
+
+            log_status = "success" if outcome["status"] == "success" else "error"
+            log_entry = make_log_entry(
+                outcome["agent_name"],
+                f"{'Completed' if log_status == 'success' else 'Failed'} for {city}"
+                + (f": {outcome['error']}" if outcome["error"] else ""),
+                status=log_status,
+            )
+            execution_log.append(log_entry)
+            if progress_callback:
+                progress_callback({"outcome": outcome, "log_entry": log_entry})
+
+    return {"results": results, "execution_log": execution_log}
+
+"""
+tools.py
+The four data-fetching tools: Amenities (OpenStreetMap/Nominatim),
+Weather (Open-Meteo), Web Research (Tavily), and Book Recommendations
+(Open Library). Every tool here is pure Python + `requests` — NONE of
+them call an LLM. Each `forward()` returns a plain, JSON-safe Python
+dict built directly from the API response, so the numbers/counts shown
+later are never invented by a model.
+"""
+
+from typing import Any, Dict
+
+import requests
+from smolagents import Tool
+
+import config
+
+
+def _get(url: str, params: dict) -> Any:
+    """Shared GET helper with a consistent timeout/User-Agent and error handling."""
+    response = requests.get(
+        url, params=params, headers=config.REQUEST_HEADERS, timeout=config.REQUEST_TIMEOUT_SECONDS
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def geocode_city(city: str) -> Dict[str, Any]:
+    """Resolves a city name to lat/lon + a bounding box using Nominatim."""
+    results = _get(f"{config.NOMINATIM_BASE_URL}/search", {
+        "q": city, "format": "json", "limit": 1, "addressdetails": 1,
+    })
+    if not results:
+        raise ValueError(f"Could not geocode city '{city}'. Try a more specific name (e.g. 'Pune, India').")
+
+    place = results[0]
+    bbox = place["boundingbox"]  # [south, north, west, east] as strings
+    return {
+        "display_name": place.get("display_name", city),
+        "lat": float(place["lat"]),
+        "lon": float(place["lon"]),
+        "bounding_box": {
+            "south": float(bbox[0]), "north": float(bbox[1]),
+            "west": float(bbox[2]), "east": float(bbox[3]),
+        },
+    }
+
+
+class AmenitiesTool(Tool):
+    name = "amenities_tool"
+    description = (
+        "Fetches approximate counts of hospitals, schools, railway stations, bus stations, "
+        "parks, restaurants, supermarkets, and coworking spaces for a given city, using "
+        "OpenStreetMap/Nominatim. Returns a structured dictionary — never invents numbers."
+    )
+    inputs = {"city": {"type": "string", "description": "City name, e.g. 'Pune' or 'Bengaluru, India'"}}
+    output_type = "object"
+
+    def forward(self, city: str) -> dict:
+        geo = geocode_city(city)
+        bbox = geo["bounding_box"]
+        viewbox = f"{bbox['west']},{bbox['north']},{bbox['east']},{bbox['south']}"
+
+        counts = {}
+        for key, query_term in config.AMENITY_QUERIES.items():
+            try:
+                results = _get(f"{config.NOMINATIM_BASE_URL}/search", {
+                    "q": query_term, "format": "json", "limit": 50,
+                    "viewbox": viewbox, "bounded": 1,
+                })
+                counts[key] = len(results)
+            except Exception:
+                counts[key] = None  # honestly report "unknown" rather than guessing
+
+        return {
+            "city": city,
+            "resolved_location": geo["display_name"],
+            "amenity_counts": counts,
+            "note": "Counts are approximate — based on OpenStreetMap listings within the city's bounding box.",
+        }
+
+
+class WeatherTool(Tool):
+    name = "weather_tool"
+    description = (
+        "Fetches current weather and a 5-day forecast (temperature, rainfall, humidity, wind) "
+        "for a given city, using the Open-Meteo API. Returns a structured dictionary."
+    )
+    inputs = {"city": {"type": "string", "description": "City name, e.g. 'Pune' or 'Bengaluru'"}}
+    output_type = "object"
+
+    def forward(self, city: str) -> dict:
+        geo_results = _get(config.OPEN_METEO_GEOCODING_URL, {"name": city, "count": 1})
+        matches = geo_results.get("results", [])
+        if not matches:
+            raise ValueError(f"Could not find weather data for '{city}'.")
+        place = matches[0]
+        lat, lon = place["latitude"], place["longitude"]
+
+        forecast = _get(config.OPEN_METEO_FORECAST_URL, {
+            "latitude": lat, "longitude": lon,
+            "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation",
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
+            "forecast_days": 5, "timezone": "auto",
+        })
+
+        return {
+            "city": city,
+            "resolved_location": f"{place.get('name')}, {place.get('country', '')}".strip(", "),
+            "current": forecast.get("current", {}),
+            "five_day_forecast": forecast.get("daily", {}),
+        }
+
+
+class TavilyResearchTool(Tool):
+    name = "tavily_research_tool"
+    description = (
+        "Searches the web (via Tavily) for cost of living, job market, rental prices, "
+        "traffic/commute, and safety/lifestyle information about a given city. Returns "
+        "structured search results (titles, snippets, URLs) per topic — not a written summary."
+    )
+    inputs = {"city": {"type": "string", "description": "City name, e.g. 'Pune' or 'Bengaluru'"}}
+    output_type = "object"
+
+    def forward(self, city: str) -> dict:
+        if not config.is_tavily_configured():
+            return {"city": city, "topics": {}, "error": "TAVILY_API_KEY is not configured."}
+
+        topics = {}
+        for topic_key, query_template in config.TAVILY_RESEARCH_TOPICS.items():
+            query = query_template.format(city=city)
+            try:
+                response = requests.post(
+                    config.TAVILY_SEARCH_URL,
+                    json={
+                        "api_key": config.TAVILY_API_KEY,
+                        "query": query,
+                        "search_depth": "basic",
+                        "max_results": 3,
+                    },
+                    timeout=config.REQUEST_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                data = response.json()
+                topics[topic_key] = [
+                    {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")[:400]}
+                    for r in data.get("results", [])
+                ]
+            except Exception as e:
+                topics[topic_key] = {"error": str(e)}
+
+        return {"city": city, "topics": topics}
+
+
+class OpenLibraryTool(Tool):
+    name = "open_library_tool"
+    description = (
+        "Searches Open Library for books related to a city's local history, culture, travel, "
+        "and relocation. Returns a structured list of book titles/authors — never invents books."
+    )
+    inputs = {"city": {"type": "string", "description": "City name, e.g. 'Pune' or 'Bengaluru'"}}
+    output_type = "object"
+
+    def forward(self, city: str) -> dict:
+        data = _get(config.OPEN_LIBRARY_SEARCH_URL, {"q": city, "limit": 6})
+        docs = data.get("docs", [])
+        books = [
+            {
+                "title": d.get("title", "Unknown title"),
+                "author": ", ".join(d.get("author_name", [])) or "Unknown author",
+                "first_publish_year": d.get("first_publish_year"),
+                "url": f"https://openlibrary.org{d.get('key', '')}" if d.get("key") else None,
+            }
+            for d in docs
+        ]
+        return {"city": city, "books": books}
+
+"""
+utils.py
+Shared helpers: execution logging and robust JSON extraction from LLM
+agent final answers (agents are instructed to answer in JSON, but we
+defensively extract the first valid JSON object rather than assuming
+the response is perfectly clean).
+"""
+
+import datetime
+import json
+import re
+from typing import Any, Dict, Optional
+
+
+def now_str() -> str:
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+
+def make_log_entry(agent_name: str, message: str, status: str = "success") -> Dict[str, Any]:
+    return {
+        "timestamp": now_str(),
+        "agent": agent_name,
+        "message": message,
+        "status": status,  # "success" | "error" | "info"
+    }
+
+
+def safe_json_dumps(data: Any, indent: int = 2) -> str:
+    try:
+        return json.dumps(data, indent=indent, default=str)
+    except (TypeError, ValueError):
+        return str(data)
+
+
+def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extracts the first valid top-level JSON object found in a block of
+    text. Agents are prompted to answer in pure JSON, but LLMs sometimes
+    wrap it in markdown fences or add a sentence before/after — this
+    strips that defensively instead of crashing the app.
+    """
+    if not text:
+        return None
+
+    # Try direct parse first (the happy path)
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Strip markdown code fences if present
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Fall back to the widest {...} span in the text
+    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if brace_match:
+        try:
+            return json.loads(brace_match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    return None
