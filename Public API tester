@@ -1,0 +1,574 @@
+import os
+import time
+from typing import Any, Dict
+
+import requests
+
+
+DEFAULT_TIMEOUT = 20
+
+
+def _result(
+    success: bool,
+    status_code: int | None = None,
+    elapsed_ms: int | None = None,
+    data: Any = None,
+    error: str | None = None,
+    request_url: str | None = None,
+) -> Dict[str, Any]:
+    return {
+        "success": success,
+        "status_code": status_code,
+        "elapsed_ms": elapsed_ms,
+        "data": data,
+        "error": error,
+        "request_url": request_url,
+    }
+
+
+def _safe_json(response: requests.Response) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        return {"raw_text": response.text[:3000]}
+
+
+def test_openstreetmap(place: str, limit: int = 5) -> Dict[str, Any]:
+    if not place.strip():
+        return _result(False, error="Please enter a place or address.")
+
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": place.strip(),
+        "format": "jsonv2",
+        "addressdetails": 1,
+        "limit": limit,
+    }
+
+    # Nominatim requires applications to identify themselves.
+    headers = {
+        "User-Agent": "PublicAPITesterLearningApp/1.0 "
+        "(educational Streamlit application)"
+    }
+
+    start = time.perf_counter()
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        elapsed = round((time.perf_counter() - start) * 1000)
+        data = _safe_json(response)
+
+        if response.ok:
+            return _result(
+                True,
+                response.status_code,
+                elapsed,
+                data,
+                request_url=response.url,
+            )
+
+        return _result(
+            False,
+            response.status_code,
+            elapsed,
+            data,
+            f"OpenStreetMap request failed: HTTP {response.status_code}.",
+            response.url,
+        )
+    except requests.RequestException as exc:
+        return _result(
+            False,
+            elapsed_ms=round((time.perf_counter() - start) * 1000),
+            error=f"OpenStreetMap connection error: {exc}",
+            request_url=url,
+        )
+
+
+def test_open_meteo(latitude: float, longitude: float) -> Dict[str, Any]:
+    if not -90 <= latitude <= 90:
+        return _result(False, error="Latitude must be between -90 and 90.")
+    if not -180 <= longitude <= 180:
+        return _result(False, error="Longitude must be between -180 and 180.")
+
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current": (
+            "temperature_2m,relative_humidity_2m,"
+            "weather_code,wind_speed_10m"
+        ),
+        "timezone": "auto",
+    }
+
+    start = time.perf_counter()
+    try:
+        response = requests.get(url, params=params, timeout=DEFAULT_TIMEOUT)
+        elapsed = round((time.perf_counter() - start) * 1000)
+        data = _safe_json(response)
+
+        if response.ok:
+            return _result(
+                True,
+                response.status_code,
+                elapsed,
+                data,
+                request_url=response.url,
+            )
+
+        return _result(
+            False,
+            response.status_code,
+            elapsed,
+            data,
+            f"Open-Meteo request failed: HTTP {response.status_code}.",
+            response.url,
+        )
+    except requests.RequestException as exc:
+        return _result(
+            False,
+            elapsed_ms=round((time.perf_counter() - start) * 1000),
+            error=f"Open-Meteo connection error: {exc}",
+            request_url=url,
+        )
+
+
+def test_open_library(query: str, limit: int = 10) -> Dict[str, Any]:
+    if not query.strip():
+        return _result(False, error="Please enter a book search query.")
+
+    url = "https://openlibrary.org/search.json"
+    params = {
+        "q": query.strip(),
+        "limit": limit,
+        "fields": (
+            "key,title,author_name,first_publish_year,"
+            "edition_count,language"
+        ),
+    }
+
+    headers = {
+        "User-Agent": "PublicAPITesterLearningApp/1.0 "
+        "(educational Streamlit application)"
+    }
+
+    start = time.perf_counter()
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        elapsed = round((time.perf_counter() - start) * 1000)
+        data = _safe_json(response)
+
+        if response.ok:
+            return _result(
+                True,
+                response.status_code,
+                elapsed,
+                data,
+                request_url=response.url,
+            )
+
+        return _result(
+            False,
+            response.status_code,
+            elapsed,
+            data,
+            f"Open Library request failed: HTTP {response.status_code}.",
+            response.url,
+        )
+    except requests.RequestException as exc:
+        return _result(
+            False,
+            elapsed_ms=round((time.perf_counter() - start) * 1000),
+            error=f"Open Library connection error: {exc}",
+            request_url=url,
+        )
+
+
+def test_tavily(
+    query: str,
+    max_results: int = 5,
+    api_key_from_ui: str = "",
+) -> Dict[str, Any]:
+    if not query.strip():
+        return _result(False, error="Please enter a Tavily search query.")
+
+    api_key = api_key_from_ui.strip() or os.getenv("TAVILY_API_KEY", "").strip()
+    if not api_key:
+        return _result(
+            False,
+            error=(
+                "Tavily API key is missing. Add TAVILY_API_KEY to .env "
+                "or enter the key in the application."
+            ),
+        )
+
+    url = "https://api.tavily.com/search"
+    payload = {
+        "query": query.strip(),
+        "search_depth": "basic",
+        "include_answer": True,
+        "include_raw_content": False,
+        "max_results": max_results,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    start = time.perf_counter()
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        elapsed = round((time.perf_counter() - start) * 1000)
+        data = _safe_json(response)
+
+        if response.ok:
+            return _result(
+                True,
+                response.status_code,
+                elapsed,
+                data,
+                request_url=url,
+            )
+
+        message = (
+            data.get("detail")
+            if isinstance(data, dict)
+            else None
+        )
+        return _result(
+            False,
+            response.status_code,
+            elapsed,
+            data,
+            (
+                f"Tavily request failed: HTTP {response.status_code}. "
+                f"{message or 'Check the API key and request parameters.'}"
+            ),
+            url,
+        )
+    except requests.RequestException as exc:
+        return _result(
+            False,
+            elapsed_ms=round((time.perf_counter() - start) * 1000),
+            error=f"Tavily connection error: {exc}",
+            request_url=url,
+        )
+
+import json
+import streamlit as st
+from dotenv import load_dotenv
+
+from api_clients import (
+    test_openstreetmap,
+    test_open_meteo,
+    test_open_library,
+    test_tavily,
+)
+
+load_dotenv()
+
+st.set_page_config(
+    page_title="Public API Tester",
+    page_icon="🧪",
+    layout="wide",
+)
+
+st.title("🧪 Public API Tester")
+st.caption(
+    "Test OpenStreetMap, Open-Meteo, Open Library, and Tavily APIs from one Streamlit application."
+)
+
+with st.sidebar:
+    st.header("API Status")
+    st.info(
+        "OpenStreetMap, Open-Meteo, and Open Library do not require an API key "
+        "for these sample requests."
+    )
+    st.warning(
+        "Tavily requires TAVILY_API_KEY in the .env file or in the input field."
+    )
+
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["OpenStreetMap", "Open-Meteo", "Open Library", "Tavily"]
+)
+
+with tab1:
+    st.subheader("OpenStreetMap / Nominatim Geocoding")
+    place = st.text_input(
+        "Place or address",
+        value="Bengaluru, India",
+        key="osm_place",
+    )
+    limit = st.slider("Maximum results", 1, 10, 5, key="osm_limit")
+
+    if st.button("Test OpenStreetMap API", type="primary"):
+        with st.spinner("Calling OpenStreetMap Nominatim..."):
+            result = test_openstreetmap(place, limit)
+
+        if result["success"]:
+            st.success(
+                f"Request successful — HTTP {result['status_code']} "
+                f"in {result['elapsed_ms']} ms"
+            )
+            rows = result["data"]
+            if rows:
+                st.dataframe(
+                    [
+                        {
+                            "Display Name": item.get("display_name"),
+                            "Latitude": item.get("lat"),
+                            "Longitude": item.get("lon"),
+                            "Type": item.get("type"),
+                        }
+                        for item in rows
+                    ],
+                    use_container_width=True,
+                )
+            else:
+                st.warning("The request succeeded, but no matching places were found.")
+            with st.expander("Raw JSON response"):
+                st.json(rows)
+        else:
+            st.error(result["error"])
+            with st.expander("Error details"):
+                st.json(result)
+
+with tab2:
+    st.subheader("Open-Meteo Weather Forecast")
+    col1, col2 = st.columns(2)
+    with col1:
+        latitude = st.number_input(
+            "Latitude", value=12.9716, format="%.4f", key="weather_lat"
+        )
+    with col2:
+        longitude = st.number_input(
+            "Longitude", value=77.5946, format="%.4f", key="weather_lon"
+        )
+
+    if st.button("Test Open-Meteo API", type="primary"):
+        with st.spinner("Calling Open-Meteo..."):
+            result = test_open_meteo(latitude, longitude)
+
+        if result["success"]:
+            st.success(
+                f"Request successful — HTTP {result['status_code']} "
+                f"in {result['elapsed_ms']} ms"
+            )
+            data = result["data"]
+            current = data.get("current", {})
+            units = data.get("current_units", {})
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(
+                "Temperature",
+                f"{current.get('temperature_2m', 'N/A')} "
+                f"{units.get('temperature_2m', '')}",
+            )
+            c2.metric(
+                "Humidity",
+                f"{current.get('relative_humidity_2m', 'N/A')} "
+                f"{units.get('relative_humidity_2m', '')}",
+            )
+            c3.metric(
+                "Wind Speed",
+                f"{current.get('wind_speed_10m', 'N/A')} "
+                f"{units.get('wind_speed_10m', '')}",
+            )
+            c4.metric("Weather Code", current.get("weather_code", "N/A"))
+
+            st.write("**Timezone:**", data.get("timezone", "N/A"))
+            st.write("**Observation time:**", current.get("time", "N/A"))
+
+            with st.expander("Raw JSON response"):
+                st.json(data)
+        else:
+            st.error(result["error"])
+            with st.expander("Error details"):
+                st.json(result)
+
+with tab3:
+    st.subheader("Open Library Book Search")
+    query = st.text_input(
+        "Book title, author, or subject",
+        value="Artificial Intelligence",
+        key="book_query",
+    )
+    book_limit = st.slider(
+        "Maximum books", 1, 20, 10, key="book_limit"
+    )
+
+    if st.button("Test Open Library API", type="primary"):
+        with st.spinner("Calling Open Library..."):
+            result = test_open_library(query, book_limit)
+
+        if result["success"]:
+            st.success(
+                f"Request successful — HTTP {result['status_code']} "
+                f"in {result['elapsed_ms']} ms"
+            )
+            data = result["data"]
+            docs = data.get("docs", [])
+            st.write(f"Approximate matching records: **{data.get('numFound', 0)}**")
+
+            if docs:
+                st.dataframe(
+                    [
+                        {
+                            "Title": book.get("title"),
+                            "Author": ", ".join(book.get("author_name", [])[:3]),
+                            "First Published": book.get("first_publish_year"),
+                            "Edition Count": book.get("edition_count"),
+                            "Language": ", ".join(book.get("language", [])[:5]),
+                        }
+                        for book in docs
+                    ],
+                    use_container_width=True,
+                )
+            else:
+                st.warning("The request succeeded, but no books were found.")
+
+            with st.expander("Raw JSON response"):
+                st.json(data)
+        else:
+            st.error(result["error"])
+            with st.expander("Error details"):
+                st.json(result)
+
+with tab4:
+    st.subheader("Tavily Search API")
+    tavily_query = st.text_input(
+        "Search query",
+        value="Latest developments in generative AI",
+        key="tavily_query",
+    )
+    tavily_key = st.text_input(
+        "Tavily API key",
+        type="password",
+        help="Optional here if TAVILY_API_KEY is already present in .env.",
+    )
+    tavily_limit = st.slider(
+        "Maximum search results", 1, 10, 5, key="tavily_limit"
+    )
+
+    if st.button("Test Tavily API", type="primary"):
+        with st.spinner("Calling Tavily..."):
+            result = test_tavily(tavily_query, tavily_limit, tavily_key)
+
+        if result["success"]:
+            st.success(
+                f"Request successful — HTTP {result['status_code']} "
+                f"in {result['elapsed_ms']} ms"
+            )
+            data = result["data"]
+
+            answer = data.get("answer")
+            if answer:
+                st.markdown("### Generated Answer")
+                st.write(answer)
+
+            st.markdown("### Search Results")
+            search_results = data.get("results", [])
+            if search_results:
+                for index, item in enumerate(search_results, start=1):
+                    title = item.get("title") or f"Result {index}"
+                    url = item.get("url", "")
+                    st.markdown(f"**{index}. [{title}]({url})**")
+                    st.write(item.get("content", "No summary returned."))
+                    if item.get("score") is not None:
+                        st.caption(f"Relevance score: {item.get('score')}")
+                    st.divider()
+            else:
+                st.warning("The request succeeded, but no search results were returned.")
+
+            with st.expander("Raw JSON response"):
+                st.json(data)
+        else:
+            st.error(result["error"])
+            with st.expander("Error details"):
+                st.json(result)
+
+st.divider()
+st.caption(
+    "This project is intended for learning and low-volume API testing. "
+    "Follow each API provider's usage policy."
+)
+
+# Public API Tester
+
+A beginner-friendly Streamlit application for testing:
+
+- OpenStreetMap through the Nominatim geocoding endpoint
+- Open-Meteo current weather endpoint
+- Open Library book search endpoint
+- Tavily Search API
+
+## API key requirements
+
+| API | API key required? |
+|---|---|
+| OpenStreetMap / Nominatim | No |
+| Open-Meteo | No |
+| Open Library | No |
+| Tavily | Yes |
+
+Add your Tavily key to `.env`:
+
+```env
+TAVILY_API_KEY=tvly-your-key-here
+```
+
+## Run the application
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## Tests included
+
+### OpenStreetMap
+
+Enter a place or address. The app displays matching locations, latitude,
+longitude, place type, HTTP status, response time, and raw JSON.
+
+### Open-Meteo
+
+Enter latitude and longitude. The app displays current temperature, humidity,
+wind speed, weather code, HTTP status, response time, and raw JSON.
+
+### Open Library
+
+Enter a title, author, or topic. The app displays matching books, authors,
+publication year, edition count, language, HTTP status, response time, and raw
+JSON.
+
+### Tavily
+
+Enter a search query and provide a Tavily API key. The app displays Tavily's
+answer, search results, relevance scores, HTTP status, response time, and raw
+JSON.
+
+## Notes
+
+- The app uses request timeouts and readable error messages.
+- The Nominatim request sends a custom User-Agent header.
+- Use the public APIs responsibly and avoid high-volume automated testing.
+- Never commit a real `.env` file containing an API key.
+
+streamlit>=1.40.0
+requests>=2.32.0
+python-dotenv>=1.0.1
