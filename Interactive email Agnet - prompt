@@ -1,0 +1,53 @@
+
+Interactive Email Agent
+Build a beginner-friendly AI-powered Interactive Email Agent using Python, Streamlit, and the OpenAI API. The application should provide a chatbot-style interface that helps users draft, refine, and send professional emails through natural language conversations.
+The assistant should interact with the user to collect all the required email details, including the recipient, CC, subject, and email body. If any information is missing, the agent should ask follow-up questions instead of making assumptions. As the conversation progresses, the email draft should be updated dynamically and displayed in a live Email Preview panel.
+Once the draft is complete, users should be able to manually edit any field before sending the email through Gmail SMTP. The application should securely load the OpenAI API Key and Gmail credentials from a .env file and display their configuration status within the application.
+The solution should have a clean, modular architecture with separate components for:
+•	Streamlit UI – Chat interface and live email preview. 
+•	Email Agent – Uses the OpenAI API to understand user intent, collect missing details, and generate or revise email drafts. 
+•	Email Service – Sends the finalized email using Gmail SMTP. 
+•	Configuration Module – Loads environment variables and application settings. 
+•	Prompt Module – Stores system prompts that guide the AI agent's behavior. 
+•	Utility Module – Common helper functions and reusable logic. 
+The application should be conversational, easy to use, and suitable for beginners learning how LLMs can automate real-world email drafting and communication workflows.
+ 
+Application Architecture
+                    User
+                      │
+                      ▼
+          Streamlit Chat Interface
+                      │
+                      ▼
+               Email Agent (OpenAI)
+        ┌─────────────┼─────────────┐
+        │             │             │
+        ▼             ▼             ▼
+ Collect Missing   Generate /    Revise Email
+ Information      Update Draft      Draft
+        │
+        ▼
+    Email Preview Panel
+(Receiver | CC | Subject | Body)
+        │
+        ▼
+ Manual User Editing (Optional)
+        │
+        ▼
+      Gmail Service (SMTP)
+        │
+        ▼
+     Recipient Inbox
+Suggested Project Structure
+Email/
+├── app.py                 # Streamlit application
+├── email_agent.py         # OpenAI-powered email generation agent
+├── email_service.py       # Gmail SMTP integration
+├── config.py              # Environment and configuration
+├── prompts.py             # System prompts for the agent
+├── utils.py               # Helper functions
+├── requirements.txt
+├── .env
+└── .gitignore
+This architecture clearly separates the user interface, AI reasoning, email delivery, and configuration, making the application simple, modular, and easy to extend.
+
