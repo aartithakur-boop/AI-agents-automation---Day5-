@@ -1,0 +1,127 @@
+
+Problem Statement
+Build a City Research Assistant that helps users compare two cities before relocating.
+The user can ask questions such as:
+“Should I move to Pune or Bengaluru?”
+The application collects information from multiple sources:
+•	OpenStreetMap / Nominatim for hospitals, schools, public transport, parks, and nearby amenities. 
+•	Open-Meteo for current weather and forecast comparison. 
+•	Tavily API for job opportunities, cost of living, traffic, lifestyle, and recent city-related information. 
+•	Open Library API for books related to the cities, local culture, travel, and relocation. 
+Multiple specialized agents perform these research tasks in parallel. A final comparison agent combines the results and generates a clear recommendation based on the user’s priorities.
+The application will use Streamlit for the user interface, Smolagents for agent orchestration, and the OpenAI API for reasoning, summarization, and recommendation generation.
+ 
+
+
+
+
+
+
+
+
+Agent Architecture
+                         User
+                           │
+                           ▼
+                 Streamlit Chat Interface
+                           │
+                           ▼
+                  Coordinator Agent
+                           │
+          ┌────────────────┼────────────────┐
+          │                │                │
+          ▼                ▼                ▼
+   Amenities Agent    Weather Agent   Web Research Agent
+          │                │                │
+          ▼                ▼                ▼
+ OpenStreetMap API   Open-Meteo API      Tavily API
+          │                │                │
+          └────────────┬───┴────────────┬───┘
+                       │                │
+                       ▼                ▼
+              Book Recommendation Agent
+                       │																																																																																																																																																		
+                       ▼
+                Open Library API
+                       │
+                       ▼
+               Comparison Agent
+                       │
+                       ▼
+          Final City Recommendation
+Agents
+1. Coordinator Agent
+The Coordinator Agent receives the user’s question and extracts:
+•	Cities to compare 
+•	User priorities 
+•	Profession or job preference 
+•	Climate preference 
+•	Family requirements 
+•	Budget expectations 
+It then assigns tasks to the specialized agents.
+2. Amenities Agent
+Uses OpenStreetMap and Nominatim to compare:
+•	Hospitals 
+•	Schools and colleges 
+•	Bus stops and railway stations 
+•	Parks 
+•	Restaurants 
+•	Supermarkets 
+•	Coworking spaces 
+•	Other nearby facilities 
+3. Weather Agent
+Uses Open-Meteo to compare:
+•	Current temperature 
+•	Minimum and maximum temperature 
+•	Rainfall 
+•	Humidity 
+•	Wind speed 
+•	Forecast conditions 
+4. Web Research Agent
+Uses the Tavily API to research:
+•	Cost of living 
+•	Rental prices 
+•	Job market 
+•	Major industries 
+•	Average commute 
+•	Traffic conditions 
+•	Safety and lifestyle 
+•	Recent developments 
+5. Book Recommendation Agent
+Uses the Open Library API to recommend books related to:
+•	Local history 
+•	Regional culture 
+•	Travel 
+•	Language 
+•	Relocation 
+•	Professional development 
+6. Comparison Agent
+The Comparison Agent receives the outputs from all agents and creates:
+•	Side-by-side city comparison 
+•	Advantages and disadvantages 
+•	Category-wise scores 
+•	Recommendation based on user priorities 
+•	Important limitations or missing data 
+ 
+Suggested Smolagents Design
+ManagerAgent
+├── AmenitiesTool
+├── WeatherTool
+├── TavilyResearchTool
+├── OpenLibraryTool
+└── CityComparisonAgent
+The API tools should return structured Python dictionaries. The OpenAI-powered comparison agent should explain the results but should not invent unavailable numerical values.
+The Streamlit interface should display:
+•	Chat-style user input 
+•	Selected cities 
+•	Agent execution status 
+•	API/tool calls 
+•	Weather comparison 
+•	Amenity counts 
+•	Research findings 
+•	Recommended books 
+•	Final relocation recommendation 
+The OpenAI API key should be loaded securely from a .env file:
+OPENAI_API_KEY=your_openai_api_key
+TAVILY_API_KEY=your_tavily_api_key
+
