@@ -1,0 +1,549 @@
+"""Streamlit UI for the Interactive Email Agent.
+
+Run with:
+    streamlit run app.py
+"""
+
+from __future__ import annotations
+
+import streamlit as st
+
+from config import get_config
+from email_agent import EmailAgent
+from email_service import EmailService, EmailServiceError
+from utils import EMPTY_DRAFT, config_status_label, missing_required_fields, normalize_draft, validate_email_address, validate_email_list
+
+
+st.set_page_config(page_title="Interactive Email Agent", page_icon="✉️", layout="wide")
+
+config = get_config()
+agent = EmailAgent(config)
+email_service = EmailService(config)
+
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": "Hi! Tell me what email you want to write. I’ll collect the recipient, CC, subject, and body step by step.",
+        }
+    ]
+if "draft" not in st.session_state:
+    st.session_state.draft = EMPTY_DRAFT.copy()
+if "missing_fields" not in st.session_state:
+    st.session_state.missing_fields = ["recipient", "subject", "body"]
+
+
+with st.sidebar:
+    st.title("⚙️ Configuration")
+    st.write("Secrets are loaded from your local `.env` file.")
+    st.write(f"OpenAI API: {config_status_label(config.openai_configured)}")
+    st.write(f"Gmail SMTP: {config_status_label(config.gmail_configured)}")
+    st.caption(f"Model: `{config.openai_model}`")
+    st.caption(f"SMTP: `{config.smtp_host}:{config.smtp_port}`")
+
+    st.divider()
+    st.subheader("Required .env values")
+    st.code(
+        "OPENAI_API_KEY=your_openai_api_key\n"
+        "OPENAI_MODEL=gpt-4.1-mini\n"
+        "GMAIL_ADDRESS=your_email@gmail.com\n"
+        "GMAIL_APP_PASSWORD=your_gmail_app_password",
+        language="bash",
+    )
+    st.info("Use a Gmail App Password, not your normal Google password.")
+
+
+st.title("✉️ Interactive Email Agent")
+st.caption("Draft, refine, preview, manually edit, and send professional emails through a chatbot-style workflow.")
+
+chat_col, preview_col = st.columns([1.15, 1])
+
+with chat_col:
+    st.subheader("Chat")
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+
+    user_input = st.chat_input("Example: Write a polite follow-up email to Priya about tomorrow's meeting...")
+    if user_input:
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        result = agent.process_message(
+            user_message=user_input,
+            current_draft=st.session_state.draft,
+            chat_history=st.session_state.messages,
+        )
+        st.session_state.draft = normalize_draft(result.get("draft"))
+        st.session_state.missing_fields = result.get("missing_fields", missing_required_fields(st.session_state.draft))
+        st.session_state.messages.append({"role": "assistant", "content": result["assistant_message"]})
+        st.rerun()
+
+with preview_col:
+    st.subheader("Live Email Preview")
+    st.caption("You can manually edit any field before sending.")
+
+    with st.form("email_preview_form"):
+        recipient = st.text_input("Receiver", value=st.session_state.draft.get("recipient", ""))
+        cc = st.text_input("CC (optional, comma-separated)", value=st.session_state.draft.get("cc", ""))
+        subject = st.text_input("Subject", value=st.session_state.draft.get("subject", ""))
+        body = st.text_area("Body", value=st.session_state.draft.get("body", ""), height=280)
+
+        save_changes, send_email = st.columns(2)
+        with save_changes:
+            save_clicked = st.form_submit_button("Save Preview Changes", use_container_width=True)
+        with send_email:
+            send_clicked = st.form_submit_button("Send Email", use_container_width=True, type="primary")
+
+    if save_clicked or send_clicked:
+        st.session_state.draft = normalize_draft(
+            {"recipient": recipient, "cc": cc, "subject": subject, "body": body}
+        )
+        st.session_state.missing_fields = missing_required_fields(st.session_state.draft)
+
+    if st.session_state.missing_fields:
+        st.warning("Missing required field(s): " + ", ".join(st.session_state.missing_fields))
+    else:
+        st.success("Draft is complete. Review carefully before sending.")
+
+    recipient_ok = validate_email_address(st.session_state.draft.get("recipient", ""))
+    cc_ok, invalid_cc = validate_email_list(st.session_state.draft.get("cc", ""))
+
+    if st.session_state.draft.get("recipient") and not recipient_ok:
+        st.error("Receiver must be a valid email address before sending.")
+    if invalid_cc:
+        st.error("Invalid CC address(es): " + ", ".join(invalid_cc))
+
+    if send_clicked:
+        try:
+            email_service.send_email(
+                recipient=st.session_state.draft["recipient"],
+                cc=st.session_state.draft["cc"],
+                subject=st.session_state.draft["subject"],
+                body=st.session_state.draft["body"],
+            )
+            st.success("Email sent successfully!")
+            st.session_state.messages.append(
+                {"role": "assistant", "content": "Your email has been sent successfully."}
+            )
+        except EmailServiceError as exc:
+            st.error(str(exc))
+
+    st.divider()
+    st.subheader("Current Draft")
+    st.markdown(f"**To:** {st.session_state.draft.get('recipient') or '—'}")
+    st.markdown(f"**CC:** {st.session_state.draft.get('cc') or '—'}")
+    st.markdown(f"**Subject:** {st.session_state.draft.get('subject') or '—'}")
+    st.text_area("Preview Body", value=st.session_state.draft.get("body", ""), height=180, disabled=True)
+
+"""Application configuration for the Interactive Email Agent.
+
+Loads secrets and settings from a local .env file. Keep .env private and never
+commit real API keys or Gmail app passwords to source control.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    """Typed application settings."""
+
+    openai_api_key: str | None
+    openai_model: str
+    gmail_address: str | None
+    gmail_app_password: str | None
+    smtp_host: str
+    smtp_port: int
+
+    @property
+    def openai_configured(self) -> bool:
+        return bool(self.openai_api_key)
+
+    @property
+    def gmail_configured(self) -> bool:
+        return bool(self.gmail_address and self.gmail_app_password)
+
+
+def _get_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def get_config() -> AppConfig:
+    """Read configuration from environment variables."""
+
+    return AppConfig(
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+        gmail_address=os.getenv("GMAIL_ADDRESS"),
+        gmail_app_password=os.getenv("GMAIL_APP_PASSWORD"),
+        smtp_host=os.getenv("SMTP_HOST", "smtp.gmail.com"),
+        smtp_port=_get_int("SMTP_PORT", 587),
+    )
+
+"""OpenAI-powered email drafting agent."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from openai import OpenAI
+
+from config import AppConfig
+from prompts import EMAIL_AGENT_SYSTEM_PROMPT
+from utils import EMPTY_DRAFT, missing_required_fields, normalize_draft, parse_json_object
+
+
+class EmailAgent:
+    """Collects missing details and maintains a professional email draft."""
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.client = OpenAI(api_key=config.openai_api_key) if config.openai_api_key else None
+
+    def process_message(
+        self,
+        user_message: str,
+        current_draft: dict[str, str] | None,
+        chat_history: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Send the conversation state to OpenAI and return the updated draft."""
+
+        if not self.client:
+            return self._fallback_response(user_message, current_draft)
+
+        draft = normalize_draft(current_draft)
+        chat_history = chat_history or []
+
+        messages = [
+            {"role": "system", "content": EMAIL_AGENT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Current draft JSON:\n"
+                    f"{draft}\n\n"
+                    "Recent chat history:\n"
+                    f"{chat_history[-8:]}\n\n"
+                    "Latest user message:\n"
+                    f"{user_message}"
+                ),
+            },
+        ]
+
+        try:
+            response = self.client.responses.create(
+                model=self.config.openai_model,
+                input=messages,
+                temperature=0.2,
+            )
+            payload = parse_json_object(response.output_text)
+            updated_draft = normalize_draft(payload.get("draft"))
+            missing = missing_required_fields(updated_draft)
+
+            return {
+                "assistant_message": payload.get("assistant_message") or self._next_question(missing),
+                "draft": updated_draft,
+                "missing_fields": missing,
+                "is_complete": len(missing) == 0,
+            }
+        except Exception as exc:  # Keeps the beginner app from crashing on API errors.
+            return {
+                "assistant_message": (
+                    "I had trouble contacting the AI model. You can still manually edit the preview, "
+                    f"or check your OpenAI settings. Error: {exc}"
+                ),
+                "draft": draft,
+                "missing_fields": missing_required_fields(draft),
+                "is_complete": False,
+            }
+
+    def _fallback_response(self, user_message: str, current_draft: dict[str, str] | None) -> dict[str, Any]:
+        """Simple response used when OPENAI_API_KEY is not configured."""
+
+        draft = normalize_draft(current_draft or EMPTY_DRAFT)
+        missing = missing_required_fields(draft)
+        return {
+            "assistant_message": (
+                "OpenAI is not configured yet. Add OPENAI_API_KEY to .env, then restart the app. "
+                f"For now, please fill these fields manually: {', '.join(missing) or 'none'}."
+            ),
+            "draft": draft,
+            "missing_fields": missing,
+            "is_complete": len(missing) == 0,
+        }
+
+    @staticmethod
+    def _next_question(missing: list[str]) -> str:
+        if not missing:
+            return "The draft looks complete. Please review it in the preview panel before sending."
+        labels = {"recipient": "recipient email address", "subject": "subject", "body": "email body"}
+        return f"Please provide the {labels.get(missing[0], missing[0])}."
+
+"""Gmail SMTP email delivery service."""
+
+from __future__ import annotations
+
+import smtplib
+from email.message import EmailMessage
+
+from config import AppConfig
+from utils import validate_email_address, validate_email_list
+
+
+class EmailServiceError(Exception):
+    """Raised when an email cannot be sent."""
+
+
+class EmailService:
+    """Small wrapper around Gmail SMTP."""
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+
+    def send_email(self, recipient: str, cc: str, subject: str, body: str) -> None:
+        """Send an email through Gmail SMTP."""
+
+        if not self.config.gmail_configured:
+            raise EmailServiceError("Gmail credentials are missing. Update your .env file first.")
+
+        recipient = recipient.strip()
+        cc = cc.strip()
+        subject = subject.strip()
+        body = body.strip()
+
+        if not validate_email_address(recipient):
+            raise EmailServiceError("Recipient must be a valid email address.")
+
+        cc_valid, invalid_cc = validate_email_list(cc)
+        if not cc_valid:
+            raise EmailServiceError(f"Invalid CC address(es): {', '.join(invalid_cc)}")
+
+        if not subject:
+            raise EmailServiceError("Subject cannot be empty.")
+        if not body:
+            raise EmailServiceError("Body cannot be empty.")
+
+        message = EmailMessage()
+        message["From"] = self.config.gmail_address
+        message["To"] = recipient
+        if cc:
+            message["Cc"] = cc
+        message["Subject"] = subject
+        message.set_content(body)
+
+        recipients = [recipient]
+        if cc:
+            recipients.extend([item.strip() for item in cc.split(",") if item.strip()])
+
+        try:
+            with smtplib.SMTP(self.config.smtp_host, self.config.smtp_port) as server:
+                server.starttls()
+                server.login(self.config.gmail_address, self.config.gmail_app_password)
+                server.send_message(message, to_addrs=recipients)
+        except smtplib.SMTPException as exc:
+            raise EmailServiceError(f"SMTP error: {exc}") from exc
+
+"""Prompt templates used by the OpenAI-powered email agent."""
+
+EMAIL_AGENT_SYSTEM_PROMPT = """
+You are an Interactive Email Agent inside a beginner-friendly Streamlit app.
+Your job is to help the user draft, refine, and prepare professional emails.
+
+Core behavior:
+1. Collect these fields: recipient, cc, subject, body.
+2. Never invent missing email details. Ask a concise follow-up question when required.
+3. Update the draft dynamically as the user provides information.
+4. Respect user instructions about tone, length, formatting, and revisions.
+5. Keep emails professional, clear, and suitable for workplace communication.
+6. If the user asks to revise, improve the existing draft instead of starting over.
+7. CC is optional. If the user does not want CC, keep it blank.
+8. Return only valid JSON. Do not include Markdown.
+
+Return this JSON object:
+{
+  "assistant_message": "short conversational response to show in chat",
+  "draft": {
+    "recipient": "email address or name supplied by user, blank if missing",
+    "cc": "comma separated CC values or blank",
+    "subject": "subject line or blank",
+    "body": "email body or blank"
+  },
+  "missing_fields": ["recipient", "subject", "body"],
+  "is_complete": false
+}
+
+Completion rules:
+- recipient, subject, and body are required.
+- cc is optional and should not block completion.
+- is_complete is true only when recipient, subject, and body are non-empty.
+- If the recipient looks like a name rather than an email address, ask for the email address before sending.
+""".strip()
+
+# Interactive Email Agent
+
+A beginner-friendly AI-powered Streamlit app that helps users draft, refine, preview, manually edit, and send professional emails through natural language conversations.
+
+## Features
+
+- Chatbot-style email drafting workflow
+- Collects receiver, CC, subject, and email body
+- Asks follow-up questions when required information is missing
+- Live Email Preview panel
+- Manual editing before sending
+- Gmail SMTP delivery
+- Secure configuration through `.env`
+- Modular beginner-friendly architecture
+
+## Project Structure
+
+```text
+Email/
+├── app.py                 # Streamlit application
+├── email_agent.py         # OpenAI-powered email generation agent
+├── email_service.py       # Gmail SMTP integration
+├── config.py              # Environment and configuration
+├── prompts.py             # System prompts for the agent
+├── utils.py               # Helper functions
+├── requirements.txt
+├── .env                   # Local placeholder; replace with real secrets
+├── .env.example
+├── .gitignore
+└── README.md
+```
+
+## Setup
+
+1. Create and activate a virtual environment.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # macOS/Linux
+# .venv\Scripts\activate   # Windows
+```
+
+2. Install dependencies.
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Update `.env` with your credentials.
+
+```bash
+OPENAI_API_KEY=your_openai_api_key
+OPENAI_MODEL=gpt-4.1-mini
+GMAIL_ADDRESS=your_email@gmail.com
+GMAIL_APP_PASSWORD=your_gmail_app_password
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+```
+
+For Gmail, use an App Password rather than your regular Google password.
+
+4. Run the app.
+
+```bash
+streamlit run app.py
+```
+
+## How It Works
+
+1. The user chats with the Streamlit interface.
+2. The Email Agent sends the current draft and latest user message to the OpenAI API.
+3. The agent returns a structured JSON response with updated fields and missing details.
+4. The preview panel displays the current draft.
+5. The user can manually edit the draft.
+6. The Email Service sends the finalized email through Gmail SMTP.
+
+## Notes for Beginners
+
+- Keep `.env` private.
+- Use `.env.example` as a safe template.
+- If OpenAI is not configured, the app still opens and lets you manually edit fields.
+- If Gmail is not configured, sending is disabled through validation errors.
+
+streamlit>=1.37.0
+openai>=1.45.0
+python-dotenv>=1.0.1
+
+"""Reusable helpers for the Interactive Email Agent."""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+
+EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+EMPTY_DRAFT = {
+    "recipient": "",
+    "cc": "",
+    "subject": "",
+    "body": "",
+}
+
+
+def normalize_draft(draft: dict[str, Any] | None) -> dict[str, str]:
+    """Return a draft with all expected keys and string values."""
+
+    draft = draft or {}
+    return {key: str(draft.get(key, "") or "").strip() for key in EMPTY_DRAFT}
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    """Parse JSON even if the model accidentally wraps it in text/code fences."""
+
+    cleaned = text.strip()
+    cleaned = cleaned.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(cleaned[start : end + 1])
+
+
+def validate_email_address(value: str) -> bool:
+    """Validate a single email address."""
+
+    return bool(EMAIL_REGEX.match(value.strip()))
+
+
+def validate_email_list(value: str) -> tuple[bool, list[str]]:
+    """Validate comma-separated email addresses. Empty values are valid."""
+
+    if not value.strip():
+        return True, []
+    addresses = [part.strip() for part in value.split(",") if part.strip()]
+    invalid = [address for address in addresses if not validate_email_address(address)]
+    return len(invalid) == 0, invalid
+
+
+def missing_required_fields(draft: dict[str, str]) -> list[str]:
+    """Return required fields that are still blank."""
+
+    required = ["recipient", "subject", "body"]
+    return [field for field in required if not draft.get(field, "").strip()]
+
+
+def config_status_label(is_configured: bool) -> str:
+    """Human-friendly configuration badge text."""
+
+    return "✅ Configured" if is_configured else "❌ Missing"
